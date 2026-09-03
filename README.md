@@ -326,6 +326,63 @@ config objects, not as a DSL.
   launchd needs the full python3 path and a local-disk install).
 - **Linux**: `deploy/claude-rotate.service` (systemd).
 
+## Comparison with similar projects
+
+The multi-account rotation niche is well populated. Stars as of Sep 2026.
+
+| Project | ⭐ | Type | Auto-rotate | Exact quota telemetry | Multi-device | Dashboard | ToS risk |
+|---|---|---|---|---|---|---|---|
+| **claude-rotate** (this) | — | server proxy | ✓ consume-first, burst pacing, hold | ✓ unified headers | ✓ device keys, per-device analytics | ✓ web panel + $-equivalent | ⚠️ gray |
+| [teamclaude](https://github.com/KarpelesLab/teamclaude) | 283 | local proxy | ✓ quota-based, per-model caps, burst pacing | ✓ unified headers | ✗ (one user's machine) | ✓ TUI | ⚠️ gray |
+| [claude-swap](https://github.com/realiti4/claude-swap) | 2.2k | credential switcher | ✓ threshold + consume-first | ✓ polls usage | ✗ per-machine | ✓ CLI/TUI + menu bar | ⚠️ gray |
+| [claude-relay-service](https://github.com/Wei-Shaw/claude-relay-service) | 12.6k | relay platform | ✓ account pool | partial | ✓ per-key clients | ✓ full admin UI | ❌ built for account sharing |
+| [CC-Router](https://github.com/VictorMinemu/CC-Router) | 28 | local proxy | round-robin only | ✗ | ✗ | ✗ | ⚠️ gray |
+| [claude-account-switcher](https://github.com/Symbioose/claude-account-switcher) | 53 | menu-bar switcher | ✓ at limits | ✓ live usage | ✗ macOS local | menu bar | ⚠️ gray / ✓ manual |
+| [ccrotate](https://github.com/somersby10ml/ccrotate), [claude-rotator](https://github.com/jtxmp/claude-rotator), [cc-relay-proxy](https://github.com/in-jun/cc-relay-proxy) | ≤7 | small CLIs/proxies | basic | ✗ | ✗ | ✗ | ⚠️ gray |
+
+**Honest reviews:**
+
+- **teamclaude** — the most sophisticated rotation engine in the field:
+  per-model weekly caps, burst-vs-quota 429 discrimination, post-failover
+  pacing, OAuth refresh, a MITM catch for hardcoded endpoints, zero npm
+  dependencies. claude-rotate adopted its burst-pacing and hold-until-reset
+  ideas. If you're one person on one machine, it's arguably the better tool;
+  it has no multi-device story.
+- **claude-swap** — the most popular and most polished UX (uv/pipx install,
+  hysteresis, quarantine of dead tokens, parallel sessions per terminal).
+  It swaps local credentials rather than proxying, so there's no
+  fleet/CI story and each machine manages its own accounts. Its
+  `consume-first` strategy is where we took the name and idea from.
+- **claude-relay-service** — by far the biggest (Redis, admin UI, multi-provider:
+  Claude/OpenAI/Gemini). It is explicitly built for **拼车 / carpooling** —
+  pooling subscription accounts across multiple people to split costs. That is
+  not a gray area: sharing consumer subscription access with third parties
+  violates Anthropic's consumer terms, and account bans around such services
+  are regularly reported. Impressive engineering; don't use it with consumer
+  Max/Pro accounts.
+- **CC-Router** — clean and simple, but blind round-robin: no telemetry, so it
+  can rotate onto a spent account and drops warm prompt caches for no reason.
+- **claude-account-switcher** (and the Alfred/menu-bar family) — solves login
+  juggling, not routing. Manual switching between your own accounts is the
+  most ToS-defensible workflow of all; the auto-switch-at-limit mode shares
+  the same gray area as everything else here.
+- **claude-rotate** — what we actually add over the field: the **multi-device
+  server model** (devices hold revocable device keys, year-long account tokens
+  never leave the server) and **per-device consumption/cost attribution**.
+  What others do better: teamclaude's per-model caps and OAuth refresh,
+  claude-swap's install/UX polish. One file, no database, by design.
+
+**On ToS, plainly:** every tool above that *automatically* rotates consumer
+subscriptions to continue past a rate limit — including claude-rotate — sits
+in the same gray area described in the note at the top of this README: you're
+automating around limits Anthropic set per account, using accounts you
+personally own and pay for. Anthropic's consumer terms prohibit sharing
+account credentials and reselling access; they are less explicit about one
+person owning several subscriptions. The bright line: **rotating your own
+accounts = gray, at your own risk; pooling/sharing/reselling access
+(claude-relay-service's core use case) = violation.** If your workload is
+commercial or shared, use the API with metered billing instead.
+
 ## Security notes
 
 - `tokens/*.token` are year-long bearer credentials for your Anthropic
