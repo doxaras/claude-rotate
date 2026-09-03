@@ -99,11 +99,9 @@ gauge moving.
   account (see [Security notes](#security-notes)). When a token dies early, the
   proxy's upstream calls start returning 401 for that account — the roadmap has
   an alert for this.
-- Scope note: subscription OAuth tokens are meant for Claude Code traffic, and
-  per the 2026 docs they are rejected by the raw Messages API. This proxy
-  forwards Claude Code's own requests, which is exactly the supported shape
-  (the `anthropic-beta: oauth-2025-04-20` behavior for raw calls is documented
-  in the continuation notes and should be re-verified before relying on it).
+- Scope note: subscription OAuth tokens are for Claude Code traffic — which is
+  all this proxy forwards — and per the 2026 docs they are rejected by the raw
+  Messages API.
 
 ## Quickstart (each device)
 
@@ -363,13 +361,10 @@ Load-bearing implementation facts (each was verified empirically — keep them):
 4. **SSE usage capture** parses `data:` lines containing `"usage"` while
    streaming chunks through untouched; audit is written in the stream's
    `finally`.
-5. **Raw `/v1/messages` calls work** with a setup-token if you add
-   `anthropic-beta: oauth-2025-04-20` — verified; this is what makes the
-   roadmap's OpenAI-compat endpoint possible without Claude Code in the loop.
 
 Roadmap, in intended order:
 
-- [x] **Tests.** `python3 tests/run_all.py` — 75 offline checks, no network
+- [x] **Tests.** `python3 tests/run_all.py` — 84 offline checks, no network
       (needs a valid `config.json` to import the module):
       `test_rotator.py` switch logic (consume-first ordering, burst-vs-quota
       429, cooldown, hysteresis, hold/exhausted verdicts, window-reset
@@ -379,11 +374,6 @@ Roadmap, in intended order:
       rewriting incl. the encoding trick, SSE relay, transparent quota-429
       rotate+retry, burst pacing, 429 passthrough vs hold-until-reset, admin
       endpoints).
-- [ ] **OpenAI-compatible endpoint.** `POST /v1/chat/completions` translating
-      OpenAI ↔ Anthropic `/v1/messages` (incl. SSE chunk translation), so any
-      OpenAI-format client or router can use the rotated capacity — not just
-      Claude Code. Inject `anthropic-version: 2023-06-01` +
-      `anthropic-beta: oauth-2025-04-20` on translated requests.
 - [ ] **Exhaustion signal.** When *all* accounts are saturated **and holding
       is off or exhausted**, return 503 + `Retry-After: <earliest reset>`
       instead of passing through Anthropic's 429, so upstream routers/breakers
