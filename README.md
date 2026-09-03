@@ -181,6 +181,8 @@ auth. Audit trail: `logs/audit.jsonl`, one JSON record per request.
 |---|---|
 | `accounts[]` | `{name, token_file}` — one `claude setup-token` per subscription, stored under `tokens/` (chmod 600) |
 | `devices{}` | `name → device key`; key is what the device puts in `CLAUDE_CODE_OAUTH_TOKEN` |
+| `accounts[].priority` | lower = preferred; accounts form tiers, backup tiers only used when every preferred account is spent (default 100) |
+| `accounts[].disabled` | `true` benches an account: never rotated onto, still shown in the panel |
 | `switch_threshold` | 5h-window utilization that triggers rotation (default 0.8) |
 | `switch_threshold_7d` | weekly-window utilization that makes an account unusable (default 0.98) |
 | `strategy` | `consume-first` (default) or `least-used` — see below |
@@ -215,6 +217,48 @@ weekly window under `switch_threshold_7d`; a window past its reset counts as
   of failing — an unattended CI/agent run finishes on its own instead of dying
   at 2am. Make sure your client's request timeout tolerates the wait (Claude
   Code's default is generous; other clients may need tuning).
+
+### Preferring one account over another
+
+Three levels of control, from lazy to pro — all in the same `config.json`,
+deliberately **no separate rules file** (see design note below):
+
+**Level 0 — do nothing.** The defaults (consume-first + thresholds + cooldown)
+already make a sane global decision. Most single-owner setups need nothing else.
+
+**Level 1 — priority tiers.** Give accounts a `priority` (lower = preferred):
+
+```json
+"accounts": [
+  { "name": "max-20x",  "token_file": "tokens/max-20x.token",  "priority": 1 },
+  { "name": "max-5x",   "token_file": "tokens/max-5x.token",   "priority": 1 },
+  { "name": "old-pro",  "token_file": "tokens/old-pro.token",  "priority": 2 }
+]
+```
+
+Rotation happens *within* the lowest-numbered tier that still has a usable
+account; `old-pro` above is touched only when both Max accounts are spent.
+When a preferred account's window resets, traffic is pulled back automatically
+(`priority_recovery` in the events feed) after the cooldown — the backup is a
+spillway, not a new home. Accounts without a `priority` share one default tier,
+which is why Level 0 works unchanged.
+
+**Level 2 — bench an account.** `"disabled": true` takes an account out of
+rotation entirely (a work account you don't want touched, one you're resting)
+while keeping it visible in the panel. If the *active* account is disabled in
+config, the proxy abandons it on the next response, cooldown or not. Re-enable
+by deleting the flag; both changes need a restart (hot reload is on the roadmap).
+
+Combine with `strategy` for the remaining temperament choice: `consume-first`
+(spend perishable weekly quota first) or `least-used` (spread evenly).
+
+**Design note — why no rules YAML:** a rules engine (per-model routes,
+time-of-day windows, per-device pinning) would add a parser, a second config
+file, and an ordering semantics to a one-file tool, and every use case we've
+actually hit decomposes into the four knobs above (strategy, priority,
+disabled, thresholds). If a real need appears that doesn't decompose — say
+per-device account pinning — add it as another plain field on the existing
+config objects, not as a DSL.
 
 ## Run as a service
 

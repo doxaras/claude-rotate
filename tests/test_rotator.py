@@ -142,4 +142,55 @@ R.STATE["accounts"] = {"a": {"util_5h": 1.0, "reset_5h": now - 10, "util_7d": 0.
 check("passed 5h reset → util 0", R.utilization("a") == 0.0)
 check("passed 7d reset → util 0", R.util_7d("a") == 0.0)
 
+# 9. priority tiers: preferred tier always beats a sooner weekly reset
+R.ACCOUNTS = {"a": {"name": "a", "priority": 2},
+              "b": {"name": "b", "priority": 1}, "c": {"name": "c", "priority": 1}}
+fresh_state()
+R.STATE["accounts"] = {
+    "a": {"util_5h": 0.1, "util_7d": 0.1, "reset_7d": now + 1000},    # soonest, but backup tier
+    "b": {"util_5h": 0.1, "util_7d": 0.1, "reset_7d": now + 500000},
+    "c": {"util_5h": 0.1, "util_7d": 0.1, "reset_7d": now + 100000},
+}
+check("priority tier beats sooner weekly reset", R.pick_account() == "c")
+
+# 9b. backup tier only used once the preferred tier is spent
+R.STATE["accounts"]["b"]["util_5h"] = 0.9
+R.STATE["accounts"]["c"]["util_5h"] = 0.9
+check("backup tier used when preferred spent", R.pick_account() == "a")
+
+# 10. priority recovery: traffic pulled back once a preferred account has room
+fresh_state("a")  # active on the backup
+R.STATE["accounts"] = {
+    "a": {"util_5h": 0.2, "util_7d": 0.1},
+    "b": {"util_5h": 0.1, "util_7d": 0.1},
+    "c": {"util_5h": 0.9, "util_7d": 0.1},
+}
+v = run(R.note_response("a", headers(u5=0.2, u7=0.1), 200))
+check("priority recovery switches back", v == "switched" and R.STATE["active_account"] == "b")
+check("recovery event reason", R.STATE["events"][-1]["reason"] == "priority_recovery")
+
+# 10b. recovery waits out the cooldown
+fresh_state("a")
+R.STATE["last_switch_ts"] = time.time()
+R.STATE["accounts"] = {"a": {"util_5h": 0.2}, "b": {"util_5h": 0.1}, "c": {"util_5h": 0.9}}
+v = run(R.note_response("a", headers(u5=0.2), 200))
+check("priority recovery respects cooldown", v is None and R.STATE["active_account"] == "a")
+
+# 11. disabled accounts: never picked, active one abandoned immediately
+R.ACCOUNTS = {"a": {"name": "a", "disabled": True}, "b": {"name": "b"}, "c": {"name": "c"}}
+fresh_state("a")
+R.STATE["accounts"] = {"a": {"util_5h": 0.0}, "b": {"util_5h": 0.2}, "c": {"util_5h": 0.1}}
+check("disabled excluded from pick", R.pick_account() == "c")
+R.STATE["last_switch_ts"] = time.time()  # even inside the cooldown
+v = run(R.note_response("a", headers(u5=0.0), 200))
+check("disabled active abandoned", v == "switched" and R.STATE["active_account"] == "c")
+check("disabled event reason", R.STATE["events"][-1]["reason"] == "account_disabled")
+
+# 11b. all-spent fallback skips disabled accounts too
+fresh_state("b")
+R.STATE["accounts"] = {"a": {"util_5h": 1.0, "reset_5h": now + 10},
+                       "b": {"util_5h": 1.0, "reset_5h": now + 100},
+                       "c": {"util_5h": 1.0, "reset_5h": now + 50}}
+check("fallback skips disabled", R.pick_account() == "c")
+
 print(f"\nall {PASS} checks passed")

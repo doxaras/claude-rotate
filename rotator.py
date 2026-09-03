@@ -117,8 +117,18 @@ def util_7d(name: str) -> float:
     return info.get("util_7d", 0.0)
 
 
+def priority(name: str) -> int:
+    """Lower = preferred. Accounts without a priority share the default tier."""
+    return ACCOUNTS[name].get("priority", 100)
+
+
+def disabled(name: str) -> bool:
+    return bool(ACCOUNTS[name].get("disabled"))
+
+
 def usable(name: str) -> bool:
-    return utilization(name) < THRESHOLD and util_7d(name) < THRESHOLD_7D
+    return (not disabled(name)
+            and utilization(name) < THRESHOLD and util_7d(name) < THRESHOLD_7D)
 
 
 def weekly_reset(name: str) -> float:
@@ -134,19 +144,22 @@ def earliest_relief() -> float:
 
 
 def pick_account() -> str:
-    """Usable = both windows under their thresholds (a passed reset counts as 0).
+    """Usable = not disabled, both windows under their thresholds (a passed
+    reset counts as 0). Priority tiers come first: a lower `priority` account
+    always beats a higher one, and the strategy orders accounts *within* a tier.
 
     consume-first (default): burn the usable account whose weekly window resets
     soonest — weekly quota is use-it-or-lose-it, so spend the perishable one.
     least-used: lowest 5h utilization.
-    If nothing is usable, the account whose 5h window resets soonest.
+    If nothing is usable, the non-disabled account whose 5h window resets soonest.
     """
     under = [n for n in ACCOUNTS if usable(n)]
     if under:
         if STRATEGY == "consume-first":
-            return min(under, key=lambda n: (weekly_reset(n), utilization(n)))
-        return min(under, key=utilization)
-    return min(ACCOUNTS, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
+            return min(under, key=lambda n: (priority(n), weekly_reset(n), utilization(n)))
+        return min(under, key=lambda n: (priority(n), utilization(n)))
+    pool = [n for n in ACCOUNTS if not disabled(n)] or list(ACCOUNTS)
+    return min(pool, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
 
 
 async def note_response(account: str, headers: httpx.Headers, status: int) -> str | None:
@@ -197,38 +210,45 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
         else:
             cooled = now - STATE.get("last_switch_ts", 0) >= COOLDOWN_S
             over = utilization(account) >= THRESHOLD or util_7d(account) >= THRESHOLD_7D
+            nxt = pick_account()
             reason = None
-            if quota_hit:
-                reason = "quota_exhausted"  # hard stop: no cooldown, no margin
-            elif over and cooled:
-                reason = f"utilization>={THRESHOLD}"
-            elif STRATEGY == "consume-first" and cooled:
-                reason = "consume_first"
+            if nxt != account:
+                if quota_hit:
+                    reason = "quota_exhausted"  # hard stop: no cooldown, no margin
+                elif disabled(account):
+                    reason = "account_disabled"  # hard rule: leave immediately
+                elif over and cooled:
+                    # Hysteresis: only move to a meaningfully better account, so
+                    # two accounts hovering at the line never ping-pong. A move
+                    # to a preferred tier, or off a week-exhausted account,
+                    # skips the margin.
+                    if (util_7d(account) >= THRESHOLD_7D
+                            or priority(nxt) < priority(account)
+                            or utilization(nxt) <= utilization(account) - SWITCH_MARGIN):
+                        reason = f"utilization>={THRESHOLD}"
+                elif cooled and usable(nxt):
+                    if priority(nxt) < priority(account):
+                        # A preferred account has room again — pull traffic back.
+                        reason = "priority_recovery"
+                    elif (STRATEGY == "consume-first"
+                          and weekly_reset(nxt) < weekly_reset(account) - CF_MARGIN_S):
+                        # Use-it-or-lose-it: proactively jump to an account whose
+                        # weekly window expires clearly sooner than the active one's.
+                        reason = "consume_first"
             if reason:
-                nxt = pick_account()
-                ok = nxt != account
-                if ok and reason.startswith("utilization") and util_7d(account) < THRESHOLD_7D:
-                    # Hysteresis: only move to a meaningfully better account,
-                    # so two accounts hovering at the line never ping-pong.
-                    ok = utilization(nxt) <= utilization(account) - SWITCH_MARGIN
-                if ok and reason == "consume_first":
-                    # Use-it-or-lose-it: proactively jump to an account whose
-                    # weekly window expires clearly sooner than the active one's.
-                    ok = usable(nxt) and weekly_reset(nxt) < weekly_reset(account) - CF_MARGIN_S
-                if ok:
-                    STATE["active_account"] = nxt
-                    STATE["last_switch_ts"] = now
-                    STATE["events"].append({
-                        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                        "type": "switch",
-                        "from": account, "to": nxt,
-                        "reason": reason,
-                        "util": utilization(account),
-                    })
-                    STATE["events"] = STATE["events"][-200:]
-                    verdict = "switched"
-                elif quota_hit:
-                    verdict = "exhausted"
+                STATE["active_account"] = nxt
+                STATE["last_switch_ts"] = now
+                STATE["events"].append({
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "type": "switch",
+                    "from": account, "to": nxt,
+                    "reason": reason,
+                    "util": utilization(account),
+                })
+                STATE["events"] = STATE["events"][-200:]
+                verdict = "switched"
+            elif quota_hit:
+                verdict = "exhausted"
         save_state()
         return verdict
 
@@ -265,6 +285,8 @@ async def rotate_status(request: Request):
         info = dict(STATE["accounts"].get(name, {}))
         info["effective_util_5h"] = utilization(name)
         info["effective_util_7d"] = util_7d(name)
+        info["priority"] = priority(name)
+        info["disabled"] = disabled(name)
         if info.get("reset_5h"):
             info["reset_5h_in_min"] = max(0, round((info["reset_5h"] - now) / 60))
         if info.get("reset_7d"):
@@ -469,7 +491,9 @@ async function refresh(){
   for(const [name,a] of Object.entries(st.accounts)){
     const u=a.effective_util_5h||0, w=a.util_7d||0;
     const act=name===st.active_account?' <span class="active">● active</span>':'';
-    h+=`<p><b>${name}</b>${act}<br>5h <span class="gauge"><i class="${u>=st.switch_threshold?'hot':''}" style="width:${Math.min(100,u*100)}%"></i></span>${(u*100).toFixed(0)}%`
+    const tags=(a.disabled?' <span class="alert-warn">(disabled)</span>':'')
+      +(a.priority!==100?` <span class="muted">prio ${a.priority}</span>`:'');
+    h+=`<p><b>${name}</b>${tags}${act}<br>5h <span class="gauge"><i class="${u>=st.switch_threshold?'hot':''}" style="width:${Math.min(100,u*100)}%"></i></span>${(u*100).toFixed(0)}%`
       +(a.reset_5h_in_min!=null?` <span class="muted">resets in ${a.reset_5h_in_min} min</span>`:'')
       +`<br>7d <span class="gauge"><i style="width:${Math.min(100,w*100)}%"></i></span>${(w*100).toFixed(0)}%`
       +(a.reset_7d_in_h!=null?` <span class="muted">resets in ${a.reset_7d_in_h} h</span>`:'')+`</p>`;
