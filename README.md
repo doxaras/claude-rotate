@@ -1,5 +1,10 @@
 # claude-rotate
 
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
+![Tests](https://img.shields.io/badge/tests-84%20passing-brightgreen)
+![Dependencies](https://img.shields.io/badge/deps-fastapi%20%7C%20httpx%20%7C%20uvicorn-lightgrey)
+
 A tiny self-hosted proxy that lets **Claude Code** ride multiple Claude
 Max/Pro subscriptions and switches accounts automatically when one hits its
 rate-limit window — with a built-in analytics panel showing quota gauges,
@@ -14,6 +19,22 @@ limit".
 > enforced by Anthropic. Rotating accounts to work past limits is a gray area
 > under Anthropic's consumer terms — use at your own risk, and do **not** use
 > consumer subscriptions to back a shared/commercial service.
+
+**Contents:**
+[How it works](#how-it-works) ·
+[Quickstart: server](#quickstart-server) ·
+[Generating tokens](#generating-account-tokens-claude-setup-token) ·
+[Quickstart: devices](#quickstart-each-device) ·
+[Networking](#connecting-distributed-devices) ·
+[Analytics panel](#analytics-panel) ·
+[Configuration](#configuration-configjson) ·
+[Run as a service](#run-as-a-service) ·
+[Troubleshooting](#troubleshooting) ·
+[Limitations](#limitations) ·
+[Operations](#operations) ·
+[Comparison](#comparison-with-similar-projects) ·
+[Security](#security-notes) ·
+[License](#license)
 
 ## How it works
 
@@ -39,6 +60,10 @@ Anthropic carries exact quota telemetry headers, so switching at 80% is
 measured, not guessed.
 
 ## Quickstart (server)
+
+Requires Python 3.10+ and three packages: `fastapi`, `httpx`, `uvicorn`
+(pinned in `requirements.txt`). Any always-on box works — a Mac mini, a
+home-lab Linux machine, a small VPS.
 
 ```bash
 git clone <this repo> && cd claude-rotate
@@ -326,6 +351,100 @@ config objects, not as a DSL.
   launchd needs the full python3 path and a local-disk install).
 - **Linux**: `deploy/claude-rotate.service` (systemd).
 
+## Troubleshooting
+
+**Client gets 401 with `claude-rotate: unknown device key`.** The proxy is
+rejecting the *device* (the error body names claude-rotate, so it's not
+Anthropic). The device's `CLAUDE_CODE_OAUTH_TOKEN` doesn't match any entry in
+`config.json` `devices{}` — re-check the key, or re-run
+`./setup.sh add-device` and restart.
+
+**Client gets a 401 whose error body comes from Anthropic.** The *account
+token* the proxy swapped in was rejected upstream — on a previously working
+account this almost always means the setup token died (revoked, or hit its
+~1-year expiry). Re-mint with `claude setup-token`, replace
+`tokens/<name>.token`, restart.
+
+**A request seems to hang.** If every account is spent and `hold_max_s` is
+set, that's hold-until-reset doing its job — the request is parked until the
+soonest 5h window reset. Check `recent_events` in `/rotate/status` for a
+`hold` entry. Set `hold_max_s: 0` if you'd rather fail fast.
+
+**"Why did it switch accounts?"** Every switch is an event in
+`/rotate/status` → `recent_events` (and the panel's *Recent switches*), with a
+reason: `quota_exhausted`, `utilization>=<threshold>`, `consume_first`,
+`priority_recovery`, or `account_disabled`. If you saw a 429 upstream but *no*
+switch, it was a per-minute burst — the proxy paced the same account on
+purpose (see [Rotation policy](#rotation-policy)).
+
+**Config edits don't take effect.** Config is read once at startup. Restart:
+`launchctl kickstart -k gui/$(id -u)/<label>` (macOS) or
+`systemctl restart claude-rotate` (Linux). Hot reload is on the roadmap.
+
+**Does the VS Code extension work?** Yes — it honours the same
+`ANTHROPIC_BASE_URL` / `CLAUDE_CODE_OAUTH_TOKEN` environment variables. Launch
+VS Code from a shell that has them exported (or set them user-wide) so the
+extension inherits them.
+
+**Panel is empty or unauthorized.** The panel needs
+`?key=<any device key>` in the URL; consumption tables build from
+`logs/audit.jsonl` and only show the last 24h, so a fresh install shows
+zeros until traffic flows.
+
+**Client throws Zlib/Brotli decoding errors.** Shouldn't happen — the proxy
+forces `accept-encoding: identity` upstream and strips `content-encoding`
+from responses. If it appears after modifying `rotator.py`, you broke
+load-bearing fact #2 in the continuation notes.
+
+## Limitations
+
+Stated plainly, in the same spirit as the [comparison](#comparison-with-similar-projects):
+
+- **One active account, globally.** Every device rides the same account at any
+  moment, so a token-hungry CI box drains the window your laptop is using.
+  Per-device *visibility* exists (panel, alerts); per-device *quotas* don't.
+- **No per-model weekly caps.** Anthropic tracks some model families
+  separately; the proxy only tracks the account-wide 5h/7d windows, so an
+  account out of (say) Opus quota gets benched entirely even if Sonnet still
+  has room. teamclaude does this better today.
+- **Switches drop warm prompt caches.** After a rotation, every device's first
+  request re-writes its prompt cache on the new account — that's the cost that
+  burst-pacing (and the hysteresis margin) exist to avoid paying needlessly.
+- **Restart to reconfigure.** No hot reload yet.
+- **Plain HTTP by design.** Transport privacy is delegated to the network
+  layer — see [Connecting distributed devices](#connecting-distributed-devices).
+- **Built on undocumented headers.** Quota telemetry comes from
+  `anthropic-ratelimit-unified-*`; if Anthropic changes them, rotation
+  degrades to reacting to 429s until the code is updated.
+- **No automatic token renewal.** Setup tokens last ~1 year and die silently;
+  the symptom is upstream 401s (see Troubleshooting).
+
+## Operations
+
+- **Audit log growth.** `logs/audit.jsonl` grows without bound (one JSON line
+  per request) and the stats endpoint re-reads it fully on every refresh, so
+  after months it slows the panel. The panel only uses the last 24h — rotate
+  the file whenever you like:
+
+  ```bash
+  # e.g. monthly via cron/launchd; the proxy recreates the file on the next request
+  mv logs/audit.jsonl "logs/audit-$(date +%Y%m).jsonl"
+  ```
+
+  No restart needed (the file is opened per write). In-process rotation is on
+  the roadmap.
+- **What to back up.** `tokens/` and `config.json` — that's the whole
+  identity of the install. `state.json` is disposable (quota state is
+  re-learned from the first responses; you only lose the events history), and
+  `logs/` is disposable analytics.
+- **Upgrades.** `git pull`, run `python3 tests/run_all.py`, restart the
+  service, then eyeball `/rotate/panel` — active account, gauges, and a
+  request flowing end-to-end.
+- **Health check.** `curl -fs http://<server>:8484/rotate/status?key=<device key>`
+  exits non-zero when the proxy is down — wire it into uptime monitoring if
+  the fleet depends on it. The launchd/systemd units in `deploy/` already
+  restart the process if it dies.
+
 ## Comparison with similar projects
 
 The multi-account rotation niche is well populated. Stars as of Sep 2026.
@@ -438,6 +557,9 @@ Roadmap, in intended order:
       the request open until the soonest reset; the 503 shape is still open.)
 - [ ] **Webhook alerts** (Slack/Teams/generic POST) firing on the same rules
       as the panel's alerts section.
+- [ ] **In-process audit rotation** — roll `logs/audit.jsonl` past a size/age
+      threshold so the Operations section's cron recipe becomes unnecessary,
+      and stop re-reading the whole file per stats call (seek from the tail).
 - [ ] **Dockerfile** (+ compose example) — also enables running as a sidecar
       next to a router in k8s; tokens mounted as secrets.
 - [ ] **Hot config reload** (`SIGHUP` or mtime check) so `add-account` /
@@ -450,3 +572,9 @@ Style: keep it one file until it genuinely hurts; stdlib + fastapi/httpx only;
 every new claim about Anthropic behavior gets verified against the live API
 before being relied on (the `phase0_proxy.py` harness exists for exactly
 that).
+
+## License
+
+[MIT](LICENSE) © 2026 John Doxaras. The Terms-of-Service note at the top of
+this README is part of the deal: this software is for rotating accounts *you*
+own and pay for, at your own risk.
