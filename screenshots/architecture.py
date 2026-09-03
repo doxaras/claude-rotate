@@ -1,4 +1,6 @@
 """Generate the claude-rotate architecture diagram (mingrammer/diagrams)."""
+from pathlib import Path
+
 from diagrams import Cluster, Diagram, Edge
 from diagrams.onprem.ci import GithubActions
 from diagrams.onprem.client import Client, User
@@ -20,7 +22,7 @@ edge_attr = {"fontsize": "11"}
 
 with Diagram(
     "",  # no title — README section heading does that job
-    filename="architecture",
+    filename=str(Path(__file__).parent / "architecture"),
     outformat="png",
     direction="LR",
     show=False,
