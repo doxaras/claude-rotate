@@ -25,7 +25,10 @@ limit".
                                            · reads anthropic-ratelimit-unified-*
                                              response headers (exact 5h/7d
                                              utilization per account)
-                                           · at ≥80% or 429 → next account
+                                           · consume-first rotation: burn the
+                                             soonest-resetting weekly quota
+                                             first; quota 429 → rotate, burst
+                                             429 → pace; all spent → hold
                                            · logs usage per device/model
 ```
 
@@ -85,12 +88,39 @@ auth. Audit trail: `logs/audit.jsonl`, one JSON record per request.
 | `accounts[]` | `{name, token_file}` — one `claude setup-token` per subscription, stored under `tokens/` (chmod 600) |
 | `devices{}` | `name → device key`; key is what the device puts in `CLAUDE_CODE_OAUTH_TOKEN` |
 | `switch_threshold` | 5h-window utilization that triggers rotation (default 0.8) |
+| `switch_threshold_7d` | weekly-window utilization that makes an account unusable (default 0.98) |
+| `strategy` | `consume-first` (default) or `least-used` — see below |
+| `switch_cooldown_s` | min seconds between voluntary switches (default 300); hard limits ignore it |
+| `switch_margin` | hysteresis: a threshold switch needs a candidate this much better (default 0.05) |
+| `consume_first_margin_s` | proactive switch only if the candidate's weekly reset is this much sooner (default 3600) |
+| `hold_max_s` | when *every* account is spent, hold the request open up to this long waiting for a window reset instead of returning 429 (default 0 = off) |
 | `prices_per_mtok` | substring-matched `[input, output]` $ per MTok for the cost columns |
 | `alerts` | `device_tokens_per_hour`, `expensive_model_patterns`, `util_warn` |
 
-Rotation policy: pick the account with the lowest 5h utilization under the
-threshold; if all are over, the one whose window resets soonest; a window that
-has passed its reset counts as 0%. State survives restarts in `state.json`.
+### Rotation policy
+
+An account is *usable* while its 5h window is under `switch_threshold` and its
+weekly window under `switch_threshold_7d`; a window past its reset counts as
+0%. State survives restarts in `state.json`.
+
+- **`consume-first`** (default): burn the usable account whose **weekly window
+  resets soonest** — weekly quota is use-it-or-lose-it, so the perishable
+  account is spent first and no paid quota expires unused. The proxy also
+  switches *proactively* (below the threshold) when another usable account's
+  weekly reset is at least `consume_first_margin_s` sooner.
+- **`least-used`**: classic — lowest 5h utilization wins.
+- A cooldown plus a hysteresis margin stop accounts ping-ponging at the
+  threshold; a hard limit (quota actually rejected) always switches
+  immediately.
+- **Burst vs quota 429s**: a per-minute rate-limit 429 (utilization not
+  exhausted) does *not* rotate — rotating would move the burst to the next
+  account and throw away its warm prompt cache. The account is paced for
+  `retry-after` seconds and the request retried.
+- **Hold-until-reset** (`hold_max_s` > 0): when every account is spent, the
+  proxy keeps the request open and retries after the soonest 5h reset instead
+  of failing — an unattended CI/agent run finishes on its own instead of dying
+  at 2am. Make sure your client's request timeout tolerates the wait (Claude
+  Code's default is generous; other clients may need tuning).
 
 ## Run as a service
 
@@ -139,18 +169,21 @@ Load-bearing implementation facts (each was verified empirically — keep them):
 
 Roadmap, in intended order:
 
-- [ ] **Tests.** Offline unit tests for `pick_account` / `note_response` /
-      `aggregate_audit` (the switch logic was only tested ad-hoc; see the
-      three scenarios: threshold switch, all-saturated fallback, window-reset
-      recovery).
+- [x] **Switch-logic tests.** `tests/test_rotator.py` — 20 offline checks for
+      `pick_account` / `note_response` (consume-first ordering, burst-vs-quota
+      429, cooldown, hysteresis, hold/exhausted verdicts, window-reset
+      recovery). Run with `python3 tests/test_rotator.py` (needs a valid
+      `config.json` to import the module). `aggregate_audit` still untested.
 - [ ] **OpenAI-compatible endpoint.** `POST /v1/chat/completions` translating
       OpenAI ↔ Anthropic `/v1/messages` (incl. SSE chunk translation), so any
       OpenAI-format client or router can use the rotated capacity — not just
       Claude Code. Inject `anthropic-version: 2023-06-01` +
       `anthropic-beta: oauth-2025-04-20` on translated requests.
-- [ ] **Exhaustion signal.** When *all* accounts are saturated, return 503 +
-      `Retry-After: <earliest reset>` instead of passing through Anthropic's
-      429, so upstream routers/breakers can degrade gracefully.
+- [ ] **Exhaustion signal.** When *all* accounts are saturated **and holding
+      is off or exhausted**, return 503 + `Retry-After: <earliest reset>`
+      instead of passing through Anthropic's 429, so upstream routers/breakers
+      can degrade gracefully. (Partially superseded: `hold_max_s` now holds
+      the request open until the soonest reset; the 503 shape is still open.)
 - [ ] **Webhook alerts** (Slack/Teams/generic POST) firing on the same rules
       as the panel's alerts section.
 - [ ] **Dockerfile** (+ compose example) — also enables running as a sidecar

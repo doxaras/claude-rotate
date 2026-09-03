@@ -11,8 +11,13 @@ Per request, the proxy:
   3. forwards to api.anthropic.com (transparent, incl. SSE streaming),
   4. records usage + account utilization (from anthropic-ratelimit-unified-*
      headers) to logs/audit.jsonl and state.json,
-  5. switches the active account when utilization crosses the threshold or
-     Anthropic rejects the request for limits.
+  5. rotates accounts: consume-first by default (burn the account whose weekly
+     window resets soonest — use-it-or-lose-it), with cooldown + hysteresis so
+     accounts never ping-pong at the threshold,
+  6. tells spent quota apart from per-minute burst 429s — a burst paces the
+     same account (keeps the warm prompt cache) instead of rotating,
+  7. optionally holds a request open until the soonest window reset when every
+     account is spent (hold_max_s), so unattended runs finish on their own.
 
 GET /rotate/status (device-key auth) returns live state for the admin page.
 """
@@ -65,6 +70,12 @@ CFG = load_config()
 DEVICE_BY_KEY = {v: k for k, v in CFG["devices"].items()}
 ACCOUNTS = {a["name"]: a for a in CFG["accounts"]}
 THRESHOLD = CFG.get("switch_threshold", 0.8)
+THRESHOLD_7D = CFG.get("switch_threshold_7d", 0.98)
+STRATEGY = CFG.get("strategy", "consume-first")  # or "least-used"
+COOLDOWN_S = CFG.get("switch_cooldown_s", 300)
+SWITCH_MARGIN = CFG.get("switch_margin", 0.05)
+CF_MARGIN_S = CFG.get("consume_first_margin_s", 3600)
+HOLD_MAX_S = CFG.get("hold_max_s", 0)  # 0 = return 429 when every account is spent
 
 
 def load_state() -> dict:
@@ -99,16 +110,52 @@ def utilization(name: str) -> float:
     return info.get("util_5h", 0.0)
 
 
+def util_7d(name: str) -> float:
+    info = STATE["accounts"].get(name, {})
+    if info.get("reset_7d") and time.time() >= info["reset_7d"]:
+        return 0.0
+    return info.get("util_7d", 0.0)
+
+
+def usable(name: str) -> bool:
+    return utilization(name) < THRESHOLD and util_7d(name) < THRESHOLD_7D
+
+
+def weekly_reset(name: str) -> float:
+    return STATE["accounts"].get(name, {}).get("reset_7d") or float("inf")
+
+
+def earliest_relief() -> float:
+    """Soonest moment any account's 5h window resets (for hold-until-reset)."""
+    now = time.time()
+    resets = [i.get("reset_5h") for i in STATE["accounts"].values()
+              if i.get("reset_5h") and i["reset_5h"] > now]
+    return min(resets) if resets else now + 300
+
+
 def pick_account() -> str:
-    """Lowest 5h utilization among accounts under threshold; else earliest reset."""
-    under = [n for n in ACCOUNTS if utilization(n) < THRESHOLD]
+    """Usable = both windows under their thresholds (a passed reset counts as 0).
+
+    consume-first (default): burn the usable account whose weekly window resets
+    soonest — weekly quota is use-it-or-lose-it, so spend the perishable one.
+    least-used: lowest 5h utilization.
+    If nothing is usable, the account whose 5h window resets soonest.
+    """
+    under = [n for n in ACCOUNTS if usable(n)]
     if under:
+        if STRATEGY == "consume-first":
+            return min(under, key=lambda n: (weekly_reset(n), utilization(n)))
         return min(under, key=utilization)
     return min(ACCOUNTS, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
 
 
-async def note_response(account: str, headers: httpx.Headers, status: int) -> None:
-    """Update account state from unified rate-limit headers; maybe switch."""
+async def note_response(account: str, headers: httpx.Headers, status: int) -> str | None:
+    """Update account state from unified rate-limit headers; maybe switch.
+
+    Returns what happened: "burst" (per-minute 429, paced — no rotation),
+    "switched" (active account changed, retry can ride it), "exhausted"
+    (quota gone and nowhere better to go), or None.
+    """
     def _f(h):
         v = headers.get(h)
         return float(v) if v is not None else None
@@ -126,23 +173,64 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> No
                 info[key] = val
         if headers.get("anthropic-ratelimit-unified-status"):
             info["status"] = headers["anthropic-ratelimit-unified-status"]
-        info["last_seen"] = time.time()
+        now = time.time()
+        info["last_seen"] = now
 
-        limited = status == 429 or info.get("status") == "rejected"
-        over = utilization(account) >= THRESHOLD
-        if (limited or over) and STATE["active_account"] == account:
-            nxt = pick_account()
-            if nxt != account:
-                STATE["active_account"] = nxt
-                STATE["events"].append({
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "type": "switch",
-                    "from": account, "to": nxt,
-                    "reason": "rate_limited" if limited else f"utilization>={THRESHOLD}",
-                    "util": utilization(account),
-                })
-                STATE["events"] = STATE["events"][-200:]
+        quota_hit = info.get("status") == "rejected" or (
+            status == 429 and (utilization(account) >= 1.0 or util_7d(account) >= 1.0))
+        if status == 429 and not quota_hit:
+            # Per-minute burst limit, not spent quota. Rotating would just move
+            # the burst to the next account and drop its warm prompt cache —
+            # pace this account briefly instead.
+            try:
+                pace = min(float(headers.get("retry-after", "")), 60.0)
+            except ValueError:
+                pace = 15.0
+            info["pace_until"] = now + pace
+            save_state()
+            return "burst"
+
+        verdict = None
+        if STATE["active_account"] != account:
+            # Another request already rotated; a retry rides the new active.
+            verdict = "switched" if quota_hit else None
+        else:
+            cooled = now - STATE.get("last_switch_ts", 0) >= COOLDOWN_S
+            over = utilization(account) >= THRESHOLD or util_7d(account) >= THRESHOLD_7D
+            reason = None
+            if quota_hit:
+                reason = "quota_exhausted"  # hard stop: no cooldown, no margin
+            elif over and cooled:
+                reason = f"utilization>={THRESHOLD}"
+            elif STRATEGY == "consume-first" and cooled:
+                reason = "consume_first"
+            if reason:
+                nxt = pick_account()
+                ok = nxt != account
+                if ok and reason.startswith("utilization") and util_7d(account) < THRESHOLD_7D:
+                    # Hysteresis: only move to a meaningfully better account,
+                    # so two accounts hovering at the line never ping-pong.
+                    ok = utilization(nxt) <= utilization(account) - SWITCH_MARGIN
+                if ok and reason == "consume_first":
+                    # Use-it-or-lose-it: proactively jump to an account whose
+                    # weekly window expires clearly sooner than the active one's.
+                    ok = usable(nxt) and weekly_reset(nxt) < weekly_reset(account) - CF_MARGIN_S
+                if ok:
+                    STATE["active_account"] = nxt
+                    STATE["last_switch_ts"] = now
+                    STATE["events"].append({
+                        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "type": "switch",
+                        "from": account, "to": nxt,
+                        "reason": reason,
+                        "util": utilization(account),
+                    })
+                    STATE["events"] = STATE["events"][-200:]
+                    verdict = "switched"
+                elif quota_hit:
+                    verdict = "exhausted"
         save_state()
+        return verdict
 
 
 def usage_from_sse(text: str, sink: dict) -> None:
@@ -176,12 +264,18 @@ async def rotate_status(request: Request):
     for name in ACCOUNTS:
         info = dict(STATE["accounts"].get(name, {}))
         info["effective_util_5h"] = utilization(name)
+        info["effective_util_7d"] = util_7d(name)
         if info.get("reset_5h"):
             info["reset_5h_in_min"] = max(0, round((info["reset_5h"] - now) / 60))
+        if info.get("reset_7d"):
+            info["reset_7d_in_h"] = max(0, round((info["reset_7d"] - now) / 3600, 1))
         accounts[name] = info
     return {
         "active_account": STATE["active_account"],
         "switch_threshold": THRESHOLD,
+        "switch_threshold_7d": THRESHOLD_7D,
+        "strategy": STRATEGY,
+        "hold_max_s": HOLD_MAX_S,
         "accounts": accounts,
         "recent_events": STATE["events"][-10:],
     }
@@ -377,7 +471,8 @@ async function refresh(){
     const act=name===st.active_account?' <span class="active">● active</span>':'';
     h+=`<p><b>${name}</b>${act}<br>5h <span class="gauge"><i class="${u>=st.switch_threshold?'hot':''}" style="width:${Math.min(100,u*100)}%"></i></span>${(u*100).toFixed(0)}%`
       +(a.reset_5h_in_min!=null?` <span class="muted">resets in ${a.reset_5h_in_min} min</span>`:'')
-      +`<br>7d <span class="gauge"><i style="width:${Math.min(100,w*100)}%"></i></span>${(w*100).toFixed(0)}%</p>`;
+      +`<br>7d <span class="gauge"><i style="width:${Math.min(100,w*100)}%"></i></span>${(w*100).toFixed(0)}%`
+      +(a.reset_7d_in_h!=null?` <span class="muted">resets in ${a.reset_7d_in_h} h</span>`:'')+`</p>`;
   }
   document.getElementById('accounts').innerHTML=h;
   document.getElementById('alerts').innerHTML = stats.alerts.length
@@ -410,11 +505,9 @@ async def proxy(request: Request, path: str):
                                         "message": "claude-rotate: unknown device key"}},
             status_code=401)
 
-    account = STATE["active_account"]
     body = await request.body()
     fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP}
     fwd_headers["accept-encoding"] = "identity"
-    fwd_headers["authorization"] = f"Bearer {ACCOUNTS[account]['token']}"
     fwd_headers.pop("x-api-key", None)
 
     model = None
@@ -425,12 +518,48 @@ async def proxy(request: Request, path: str):
             pass
 
     url = "/" + path + ("?" + str(request.url.query) if request.url.query else "")
-    upstream = await client.send(
-        client.build_request(request.method, url, headers=fwd_headers, content=body),
-        stream=True)
+    hold_deadline = time.time() + HOLD_MAX_S if HOLD_MAX_S else None
+    retries = 0
+    noted = False  # note_response already ran for the response we're returning
+    while True:
+        account = STATE["active_account"]
+        fwd_headers["authorization"] = f"Bearer {ACCOUNTS[account]['token']}"
+        pace = STATE["accounts"].get(account, {}).get("pace_until", 0) - time.time()
+        if pace > 0:
+            await asyncio.sleep(min(pace, 60))
+        upstream = await client.send(
+            client.build_request(request.method, url, headers=fwd_headers, content=body),
+            stream=True)
+        if upstream.status_code != 429:
+            break
+        verdict = await note_response(account, upstream.headers, 429)
+        wait = 0.0
+        retry = verdict in ("switched", "burst") and retries < 5
+        if not retry and verdict == "exhausted" and hold_deadline:
+            # Every account is spent: hold the request open until the soonest
+            # window reset instead of failing, so unattended runs finish.
+            wait = min(earliest_relief() + 5, hold_deadline) - time.time()
+            retry = wait > 0
+        if not retry:
+            noted = True
+            break
+        await upstream.aread()
+        await upstream.aclose()
+        retries += 1
+        if wait > 0:
+            async with state_lock:
+                STATE["events"].append({
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "hold",
+                    "from": account, "to": account,
+                    "reason": f"all accounts spent; holding {round(wait)}s"})
+                STATE["events"] = STATE["events"][-200:]
+                save_state()
+            await asyncio.sleep(wait)
 
     rec = {"device": device, "account": account, "path": "/" + path,
            "model": model, "status": upstream.status_code}
+    if retries:
+        rec["retries"] = retries
     resp_headers = {k: v for k, v in upstream.headers.items()
                     if k.lower() not in HOP and k.lower() != "content-encoding"}
 
@@ -462,7 +591,8 @@ async def proxy(request: Request, path: str):
     rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
     if rec["path"].startswith("/v1/messages") or rec.get("usage"):
         audit(rec)
-    await note_response(account, upstream.headers, upstream.status_code)
+    if not noted:
+        await note_response(account, upstream.headers, upstream.status_code)
     return Response(content=content, status_code=upstream.status_code, headers=resp_headers)
 
 
