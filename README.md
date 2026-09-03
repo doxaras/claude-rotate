@@ -45,20 +45,15 @@ requests, 1 switch, 0 stampede. Reproducible numbers in
 
 ## How it works
 
-```
- laptop ──┐   Claude Code sends            claude-rotate (this proxy)          Anthropic
- desktop ─┼─  Authorization: Bearer   ──▶  · authenticates the device    ──▶  api.anthropic.com
- ci box ──┘   <device key>                 · swaps in the active account's
-                                             long-lived setup-token
-                                           · reads anthropic-ratelimit-unified-*
-                                             response headers (exact 5h/7d
-                                             utilization per account)
-                                           · consume-first rotation: burn the
-                                             soonest-resetting weekly quota
-                                             first; quota 429 → rotate, burst
-                                             429 → pace; all spent → hold
-                                           · logs usage per device/model
-```
+![claude-rotate architecture: devices authenticate with device keys, the proxy swaps in the active account's setup-token, forwards to api.anthropic.com, reads exact quota telemetry back, and rotates consume-first](screenshots/architecture.png)
+
+Per request the proxy: authenticates the device (device key → device name),
+swaps in the active account's long-lived setup-token, forwards transparently,
+reads the exact `anthropic-ratelimit-unified-*` quota headers off the
+response, applies the rotation policy (consume-first; quota 429 → rotate,
+burst 429 → pace, all spent → hold), and logs usage per device/model.
+Diagram regenerates with `python3 screenshots/architecture.py`
+(needs `pip install diagrams` + graphviz).
 
 Key insight: Claude Code respects `ANTHROPIC_BASE_URL`, and `claude
 setup-token` mints a ~1-year OAuth token per account. The proxy holds those
