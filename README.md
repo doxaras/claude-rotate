@@ -169,11 +169,16 @@ Load-bearing implementation facts (each was verified empirically — keep them):
 
 Roadmap, in intended order:
 
-- [x] **Switch-logic tests.** `tests/test_rotator.py` — 20 offline checks for
-      `pick_account` / `note_response` (consume-first ordering, burst-vs-quota
+- [x] **Tests.** `python3 tests/run_all.py` — 75 offline checks, no network
+      (needs a valid `config.json` to import the module):
+      `test_rotator.py` switch logic (consume-first ordering, burst-vs-quota
       429, cooldown, hysteresis, hold/exhausted verdicts, window-reset
-      recovery). Run with `python3 tests/test_rotator.py` (needs a valid
-      `config.json` to import the module). `aggregate_audit` still untested.
+      recovery); `test_analytics.py` SSE usage capture, pricing/cost math,
+      `aggregate_audit` rollups/alerts/roster; `test_proxy.py` end-to-end HTTP
+      through the real ASGI app against a mocked upstream (auth, header
+      rewriting incl. the encoding trick, SSE relay, transparent quota-429
+      rotate+retry, burst pacing, 429 passthrough vs hold-until-reset, admin
+      endpoints).
 - [ ] **OpenAI-compatible endpoint.** `POST /v1/chat/completions` translating
       OpenAI ↔ Anthropic `/v1/messages` (incl. SSE chunk translation), so any
       OpenAI-format client or router can use the rotated capacity — not just
