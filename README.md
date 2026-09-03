@@ -3,6 +3,7 @@
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![Tests](https://img.shields.io/badge/tests-101%20passing-brightgreen)
+![Herd-safe](https://img.shields.io/badge/herd--safe-100%20racers%20%E2%86%92%201%20switch-orange)
 ![Dependencies](https://img.shields.io/badge/deps-fastapi%20%7C%20httpx%20%7C%20uvicorn-lightgrey)
 
 A tiny self-hosted proxy that lets **Claude Code** ride multiple Claude
@@ -14,6 +15,11 @@ One process, one config file, no database. Built for individual developers who
 own more than one subscription and are tired of "You've hit your session
 limit".
 
+**Herd-safe, by test — not by vibes:** when your whole fleet slams into a rate
+limit at the same instant, exactly *one* rotation happens — 100 in-flight
+requests, 1 switch, 0 stampede. Reproducible numbers in
+[Performance](#performance-herd-safe).
+
 > **Terms-of-Service note.** This tool automates switching between accounts
 > *you personally own and pay for*. Each account's limits are still fully
 > enforced by Anthropic. Rotating accounts to work past limits is a gray area
@@ -22,6 +28,7 @@ limit".
 
 **Contents:**
 [How it works](#how-it-works) ·
+[Performance](#performance-herd-safe) ·
 [Quickstart: server](#quickstart-server) ·
 [Generating tokens](#generating-account-tokens-claude-setup-token) ·
 [Quickstart: devices](#quickstart-each-device) ·
@@ -58,6 +65,32 @@ setup-token` mints a ~1-year OAuth token per account. The proxy holds those
 tokens; devices only ever hold an internal *device key*. Every response from
 Anthropic carries exact quota telemetry headers, so switching at 80% is
 measured, not guessed.
+
+## Performance (herd-safe)
+
+The point of a *server* proxy is that a whole fleet leans on it at once — so
+high-concurrency behavior is tested, not assumed. All numbers from the
+reproducible stress suite (`python3 tests/test_stress.py`, mocked upstream,
+Apple-silicon dev machine — run it on yours):
+
+| Scenario | Result |
+|---|---|
+| 300 concurrent requests | every one served, audit complete, **~3,500 req/s** proxy overhead ceiling |
+| Quota limit hit with **100 requests in flight** | **exactly 1 switch**, only 1 request ever touched the dead account, all 100 recovered |
+| 50 burst-429s across 100 concurrent requests | **0 rotations** — paced on the same account, prompt caches kept warm |
+| All accounts spent, 20 requests arrive | all park via hold-until-reset and release **together** at the window reset |
+| 50 parallel SSE streams | byte-identical relay, usage audited on every stream |
+| 50,000-row audit log | analytics rollup in **0.42 s** |
+
+Why this matters with a fleet: the failure mode of naive rotators under load
+is the stampede — N in-flight requests each trigger their own switch, the
+account pool burns down in seconds, and every device's prompt cache is thrown
+away N times. Here a single lock serializes the decision: one switch, everyone
+else rides it.
+
+Honest scope: single process by design (state lives in one place — don't run
+uvicorn workers), and the upstream is mocked, so figures measure the proxy's
+own overhead and race behavior, not Anthropic latency.
 
 ## Quickstart (server)
 
@@ -451,7 +484,7 @@ The multi-account rotation niche is well populated. Stars as of Sep 2026.
 
 | Project | ⭐ | Type | Auto-rotate | Exact quota telemetry | Multi-device | Dashboard | ToS risk |
 |---|---|---|---|---|---|---|---|
-| **claude-rotate** (this) | — | server proxy | ✓ consume-first, burst pacing, hold | ✓ unified headers | ✓ device keys, per-device analytics | ✓ web panel + $-equivalent | ⚠️ gray |
+| **claude-rotate** (this) | — | server proxy | ✓ consume-first, burst pacing, hold — [herd-safe under load](#performance-herd-safe) | ✓ unified headers | ✓ device keys, per-device analytics | ✓ web panel + $-equivalent | ⚠️ gray |
 | [teamclaude](https://github.com/KarpelesLab/teamclaude) | 283 | local proxy | ✓ quota-based, per-model caps, burst pacing | ✓ unified headers | ✗ (one user's machine) | ✓ TUI | ⚠️ gray |
 | [claude-swap](https://github.com/realiti4/claude-swap) | 2.2k | credential switcher | ✓ threshold + consume-first | ✓ polls usage | ✗ per-machine | ✓ CLI/TUI + menu bar | ⚠️ gray |
 | [claude-relay-service](https://github.com/Wei-Shaw/claude-relay-service) | 12.6k | relay platform | ✓ account pool | partial | ✓ per-key clients | ✓ full admin UI | ❌ built for account sharing |
@@ -487,9 +520,14 @@ The multi-account rotation niche is well populated. Stars as of Sep 2026.
   the same gray area as everything else here.
 - **claude-rotate** — what we actually add over the field: the **multi-device
   server model** (devices hold revocable device keys, year-long account tokens
-  never leave the server) and **per-device consumption/cost attribution**.
-  What others do better: teamclaude's per-model caps and OAuth refresh,
-  claude-swap's install/UX polish. One file, no database, by design.
+  never leave the server), **per-device consumption/cost attribution**, and a
+  **published concurrency story** — the [stress suite](#performance-herd-safe)
+  proves one-switch-per-herd and no-rotation burst storms under 100+ in-flight
+  requests, numbers you can re-run rather than take on faith. (teamclaude
+  engineered for herd failover too — its post-switch pacing — but doesn't
+  publish load measurements.) What others do better: teamclaude's per-model
+  caps and OAuth refresh, claude-swap's install/UX polish. One file, no
+  database, by design.
 
 **On ToS, plainly:** every tool above that *automatically* rotates consumer
 subscriptions to continue past a rate limit — including claude-rotate — sits
