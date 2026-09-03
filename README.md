@@ -2,7 +2,7 @@
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-101%20passing-brightgreen)
+[![tests](https://github.com/doxaras/claude-rotate/actions/workflows/tests.yml/badge.svg)](https://github.com/doxaras/claude-rotate/actions/workflows/tests.yml)
 ![Herd-safe](https://img.shields.io/badge/herd--safe-100%20racers%20%E2%86%92%201%20switch-orange)
 ![Dependencies](https://img.shields.io/badge/deps-fastapi%20%7C%20httpx%20%7C%20uvicorn-lightgrey)
 

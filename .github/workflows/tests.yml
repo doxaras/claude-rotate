@@ -1,0 +1,37 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create test fixture config
+        # Importing rotator needs a config.json with at least one account
+        # whose token file exists. The tests override everything else.
+        run: |
+          cp config.example.json config.json
+          mkdir -p tokens logs
+          echo "sk-ant-oat01-ci-dummy-token" > tokens/acct-1.token
+          echo "sk-ant-oat01-ci-dummy-token" > tokens/acct-2.token
+
+      - name: Run test suite
+        run: python tests/run_all.py
