@@ -50,6 +50,61 @@ pip install -r requirements.txt
 python3 rotator.py
 ```
 
+## Generating account tokens (`claude setup-token`)
+
+Each subscription account contributes one long-lived OAuth token. Facts below
+are from the [official authentication docs](https://code.claude.com/docs/en/authentication.md)
+unless flagged otherwise.
+
+**Minting a token:**
+
+```bash
+claude setup-token
+```
+
+- Opens the same browser OAuth flow as `/login`; if no browser can reach the
+  local callback (headless server, SSH session), it falls back to a paste-a-code
+  flow — so you can mint tokens on the proxy server itself.
+- Prints a token starting `sk-ant-oat01-…` to the terminal and does **not**
+  save it anywhere — copy it straight into `./setup.sh add-account <name>`,
+  which stores it under `tokens/` (chmod 600, gitignored).
+- Valid for **about one year**. Requires a Claude subscription (Pro, Max,
+  Team, or Enterprise).
+
+**Minting for multiple accounts from one machine.** The account that completes
+the browser OAuth is the account the token belongs to — the CLI's current
+login doesn't decide it. (Officially undocumented; this is the behavior in
+practice.) Two workable recipes:
+
+1. **Browser profiles**: keep one browser profile (or incognito window) logged
+   into claude.ai per account. Run `claude setup-token`, and complete the OAuth
+   in the profile of the account you're minting for — copy the URL into that
+   profile if the wrong one opens.
+2. **Config-dir isolation**: `CLAUDE_CONFIG_DIR=~/.claude-acct2 claude
+   setup-token` keeps a fully separate CLI login per directory, useful if you
+   also want to *run* Claude Code as different accounts.
+
+After adding an account, send one request through the proxy and check
+`/rotate/status` — the unified utilization headers it reports are per-account,
+so a token minted against the wrong account shows up immediately as the wrong
+gauge moving.
+
+**Lifetime & revocation:**
+
+- There is currently **no CLI command to list or revoke** setup tokens
+  ([open feature request](https://github.com/anthropics/claude-code/issues/57400));
+  revoke manually from claude.ai settings. `/logout` only revokes the CLI's
+  *active* session credential, not previously minted setup tokens.
+- Treat each token file as a year-long bearer credential for that Anthropic
+  account (see [Security notes](#security-notes)). When a token dies early, the
+  proxy's upstream calls start returning 401 for that account — the roadmap has
+  an alert for this.
+- Scope note: subscription OAuth tokens are meant for Claude Code traffic, and
+  per the 2026 docs they are rejected by the raw Messages API. This proxy
+  forwards Claude Code's own requests, which is exactly the supported shape
+  (the `anthropic-beta: oauth-2025-04-20` behavior for raw calls is documented
+  in the continuation notes and should be re-verified before relying on it).
+
 ## Quickstart (each device)
 
 Two env vars in your shell profile — that's the whole client install:
@@ -160,6 +215,13 @@ can be revoked alone.
 ## Analytics panel
 
 Open `http://<server>:8484/rotate/panel?key=<any device key>`:
+
+![claude-rotate analytics panel — devices, account gauges, consumption and cost-equivalent tables](screenshots/panel.png)
+
+Live 5-hour and weekly gauges per account, straight from Anthropic's own
+rate-limit headers:
+
+![account quota gauges with reset countdowns](screenshots/accounts.png)
 
 - **Devices** — every registered device: online status, last seen, last model,
   which account its traffic rode, requests + tokens in the last hour.
