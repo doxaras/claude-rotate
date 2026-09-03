@@ -61,7 +61,101 @@ export CLAUDE_CODE_OAUTH_TOKEN=<device key printed by add-device>
 
 Run `claude` as usual. When account 1's 5-hour window fills, the next request
 rides account 2. Use a VPN/overlay like Tailscale between devices and server —
-the proxy speaks plain HTTP and device keys are bearer secrets.
+the proxy speaks plain HTTP and device keys are bearer secrets. See
+[Connecting distributed devices](#connecting-distributed-devices) for setups.
+
+## Connecting distributed devices
+
+The proxy is plain HTTP and device keys are bearer secrets, so the transport
+between devices and server must be private. Pick one:
+
+### Tailscale (recommended)
+
+Zero-config WireGuard mesh; free tier covers personal use easily.
+
+```bash
+# on the server AND every device:
+#   macOS:  brew install tailscale && brew services start tailscale
+#   Linux:  curl -fsSL https://tailscale.com/install.sh | sh
+tailscale up                      # login once per machine, same tailnet
+tailscale status                  # note the server's name / 100.x.y.z address
+```
+
+With MagicDNS on (default on new tailnets), devices reach the server by name:
+
+```bash
+export ANTHROPIC_BASE_URL=http://<server-hostname>:8484   # e.g. http://ais-mac-mini:8484
+export CLAUDE_CODE_OAUTH_TOKEN=<device key>
+```
+
+Tighten the listener so the proxy is *only* reachable over the tailnet — set
+`bind` in `config.json` to the server's Tailscale IP instead of `0.0.0.0`:
+
+```json
+{ "bind": "100.x.y.z", "port": 8484 }
+```
+
+Optional TLS: `tailscale serve --bg http://127.0.0.1:8484` publishes the proxy
+as `https://<server>.<tailnet>.ts.net` (valid cert, tailnet-only). Then use
+that URL as `ANTHROPIC_BASE_URL` and set `bind` to `127.0.0.1`.
+
+CI runners and containers work too: ephemeral auth keys
+(`tailscale up --auth-key=tskey-...`) join a runner to the tailnet for the
+duration of a job; there's a ready-made GitHub Action (`tailscale/github-action`).
+
+### Plain WireGuard
+
+Same effect, no third party. Sketch: generate a keypair per machine
+(`wg genkey | tee private.key | wg pubkey > public.key`), give the server a
+`wg0` with an internal subnet (e.g. `10.84.0.1/24`), add each device as a
+`[Peer]` with `AllowedIPs = 10.84.0.X/32`, and point devices at
+`http://10.84.0.1:8484`. Set `bind` to `10.84.0.1`. More manual than
+Tailscale (key distribution, NAT traversal is on you), but fully self-hosted.
+
+### SSH tunnel (zero install)
+
+Any device that can SSH to the server needs nothing else:
+
+```bash
+ssh -N -L 8484:127.0.0.1:8484 user@server &
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8484
+```
+
+With `bind: 127.0.0.1` on the server, this is the tightest setup — the proxy
+never listens on a network interface at all. Use `autossh` (or
+`ServerAliveInterval 30` in `~/.ssh/config`) to keep the tunnel up; fine for a
+laptop or a single CI box, tedious beyond a few devices.
+
+### Cloudflare Tunnel (device without VPN access)
+
+For a device that can't join your tailnet (locked-down corp machine, hosted
+CI you can't install agents on), `cloudflared` can expose the proxy through
+Cloudflare without opening ports:
+
+```bash
+# server:
+cloudflared tunnel login
+cloudflared tunnel create claude-rotate
+cloudflared tunnel route dns claude-rotate rotate.example.com
+cloudflared tunnel run --url http://127.0.0.1:8484 claude-rotate
+# device:
+export ANTHROPIC_BASE_URL=https://rotate.example.com
+```
+
+**This makes the proxy internet-reachable** — the only thing between the
+world and your Anthropic tokens is the device-key check. If you go this
+route, put [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/)
+(a Zero Trust service-token policy) in front so unauthenticated requests never
+reach the proxy, and treat device keys as revocable: delete a leaked one from
+`config.json` and restart. Prefer any of the VPN options above when possible.
+
+### Other overlays
+
+ZeroTier and NetBird work identically to Tailscale for this purpose (private
+overlay IP + `bind` to it); use whichever your fleet already runs. Whatever
+the transport, the checklist is the same: proxy bound to a private interface,
+HTTP never exposed publicly, one device key per machine so any single machine
+can be revoked alone.
 
 ## Analytics panel
 
