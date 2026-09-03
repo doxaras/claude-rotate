@@ -195,7 +195,7 @@ tailscale status                  # note the server's name / 100.x.y.z address
 With MagicDNS on (default on new tailnets), devices reach the server by name:
 
 ```bash
-export ANTHROPIC_BASE_URL=http://<server-hostname>:8484   # e.g. http://ais-mac-mini:8484
+export ANTHROPIC_BASE_URL=http://<server-hostname>:8484   # e.g. http://my-server:8484
 export CLAUDE_CODE_OAUTH_TOKEN=<device key>
 ```
 

@@ -2,7 +2,7 @@
 
 Devices point at this proxy and authenticate with an internal device key:
 
-    export ANTHROPIC_BASE_URL=http://ais-mac-mini:8484   # over tailscale
+    export ANTHROPIC_BASE_URL=http://my-server:8484   # over tailscale
     export CLAUDE_CODE_OAUTH_TOKEN=<device key from config.json>
 
 Per request, the proxy:
