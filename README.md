@@ -2,7 +2,7 @@
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-84%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-101%20passing-brightgreen)
 ![Dependencies](https://img.shields.io/badge/deps-fastapi%20%7C%20httpx%20%7C%20uvicorn-lightgrey)
 
 A tiny self-hosted proxy that lets **Claude Code** ride multiple Claude
@@ -540,7 +540,7 @@ Load-bearing implementation facts (each was verified empirically — keep them):
 
 Roadmap, in intended order:
 
-- [x] **Tests.** `python3 tests/run_all.py` — 84 offline checks, no network
+- [x] **Tests.** `python3 tests/run_all.py` — 101 offline checks, no network
       (needs a valid `config.json` to import the module):
       `test_rotator.py` switch logic (consume-first ordering, burst-vs-quota
       429, cooldown, hysteresis, hold/exhausted verdicts, window-reset
@@ -549,7 +549,11 @@ Roadmap, in intended order:
       through the real ASGI app against a mocked upstream (auth, header
       rewriting incl. the encoding trick, SSE relay, transparent quota-429
       rotate+retry, burst pacing, 429 passthrough vs hold-until-reset, admin
-      endpoints).
+      endpoints); `test_stress.py` high-traffic behavior (300-request
+      fan-out with throughput floor, exactly-one-switch race check with 100
+      in-flight requests during a quota hit, burst storm without rotation,
+      20 concurrent held requests, 50 parallel SSE streams, events-list
+      bound under churn, aggregate_audit speed on a 50k-row log).
 - [ ] **Exhaustion signal.** When *all* accounts are saturated **and holding
       is off or exhausted**, return 503 + `Retry-After: <earliest reset>`
       instead of passing through Anthropic's 429, so upstream routers/breakers
