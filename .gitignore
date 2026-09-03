@@ -1,0 +1,9 @@
+# Local secrets and runtime state — never commit
+config.json
+tokens/
+*.token
+state.json
+logs/
+__pycache__/
+*.pyc
+.DS_Store

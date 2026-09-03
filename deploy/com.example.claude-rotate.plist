@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- macOS launchd agent. Install:
+       cp deploy/com.example.claude-rotate.plist ~/Library/LaunchAgents/
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.claude-rotate.plist
+     Gotchas (learned the hard way):
+       * Pin the FULL python3 path (launchd's PATH resolves python3 to an ancient
+         Xcode build that can't parse modern syntax).
+       * The project must live on the LOCAL disk — launchd background jobs get
+         "Operation not permitted" reading external/removable volumes (TCC).  -->
+<dict>
+    <key>Label</key>
+    <string>com.example.claude-rotate</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/Users/YOU/claude-rotate/rotator.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/Library/Logs/claude-rotate/rotator.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/Library/Logs/claude-rotate/rotator.err</string>
+</dict>
+</plist>
