@@ -33,6 +33,8 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from oai_compat import SseToOai, anthropic_to_oai, oai_to_anthropic
+
 ROOT = Path(__file__).parent
 CONFIG_PATH = ROOT / "config.json"
 STATE_PATH = ROOT / "state.json"
@@ -520,6 +522,147 @@ async def rotate_panel(request: Request):
     return Response(content=PANEL_HTML, media_type="text/html")
 
 
+async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
+    """The rotation loop shared by the transparent proxy and the OpenAI endpoint:
+    pick the active account, pace bursts, retry through switches, optionally hold
+    until the soonest window reset. Returns (upstream, account, retries, noted,
+    verdict) — noted means note_response already ran for the returned response;
+    verdict is note_response's word for the LAST 429 seen ("burst" / "switched" /
+    "exhausted" / None)."""
+    hold_deadline = time.time() + HOLD_MAX_S if HOLD_MAX_S else None
+    retries = 0
+    noted = False
+    verdict = None
+    while True:
+        account = STATE["active_account"]
+        fwd_headers["authorization"] = f"Bearer {ACCOUNTS[account]['token']}"
+        pace = STATE["accounts"].get(account, {}).get("pace_until", 0) - time.time()
+        if pace > 0:
+            await asyncio.sleep(min(pace, 60))
+        upstream = await client.send(
+            client.build_request(method, url, headers=fwd_headers, content=body),
+            stream=True)
+        if upstream.status_code != 429:
+            return upstream, account, retries, noted, verdict
+        verdict = await note_response(account, upstream.headers, 429)
+        wait = 0.0
+        retry = verdict in ("switched", "burst") and retries < 5
+        if not retry and verdict == "exhausted" and hold_deadline:
+            # Every account is spent: hold the request open until the soonest
+            # window reset instead of failing, so unattended runs finish.
+            wait = min(earliest_relief() + 5, hold_deadline) - time.time()
+            retry = wait > 0
+        if not retry:
+            noted = True
+            return upstream, account, retries, noted, verdict
+        await upstream.aread()
+        await upstream.aclose()
+        retries += 1
+        if wait > 0:
+            async with state_lock:
+                STATE["events"].append({
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "hold",
+                    "from": account, "to": account,
+                    "reason": f"all accounts spent; holding {round(wait)}s"})
+                STATE["events"] = STATE["events"][-200:]
+                save_state()
+            await asyncio.sleep(wait)
+
+
+@app.post("/v1/chat/completions")
+async def openai_chat(request: Request):
+    """OpenAI-compatible front door (Phase 3): any OpenAI-format client or router
+    rides the rotated Max capacity through here. Translation to /v1/messages with
+    the oauth beta header; NO client headers are forwarded, so caller identity
+    stops at this proxy — upstream sees one consumer per device key. When every
+    account's window is spent this returns 503 + Retry-After (a breaker-friendly
+    signal for routers), unlike the transparent proxy below, which stays
+    transparent because Claude Code handles Anthropic's own 429s natively."""
+    device = device_from_request(request)
+    if device is None:
+        return JSONResponse({"error": {"message": "claude-rotate: unknown device key",
+                                       "type": "authentication_error"}}, status_code=401)
+    try:
+        oai = json.loads(await request.body())
+    except json.JSONDecodeError:
+        return JSONResponse({"error": {"message": "body is not valid JSON",
+                                       "type": "invalid_request_error"}}, status_code=400)
+    abody, err = oai_to_anthropic(oai)
+    if err:
+        return JSONResponse({"error": {"message": err, "type": "invalid_request_error"}},
+                            status_code=400)
+    fwd = {"content-type": "application/json", "accept-encoding": "identity",
+           "anthropic-version": "2023-06-01", "anthropic-beta": "oauth-2025-04-20"}
+    upstream, account, retries, noted, verdict = await send_upstream(
+        "POST", "/v1/messages", fwd, json.dumps(abody).encode())
+
+    rec = {"device": device, "account": account, "path": "/v1/chat/completions",
+           "model": abody.get("model"), "status": upstream.status_code}
+    if retries:
+        rec["retries"] = retries
+    resp_headers = {"x-rotate-account": account}
+    for h in ("anthropic-ratelimit-unified-5h-utilization",
+              "anthropic-ratelimit-unified-7d-utilization",
+              "anthropic-ratelimit-unified-5h-reset",
+              "anthropic-ratelimit-unified-status"):
+        if upstream.headers.get(h):
+            resp_headers[h] = upstream.headers[h]
+
+    if upstream.status_code == 429 and verdict == "exhausted":
+        await upstream.aread()
+        await upstream.aclose()
+        retry_after = max(1, round(earliest_relief() - time.time()))
+        rec["status"] = 503
+        audit(rec)
+        return JSONResponse(
+            {"error": {"message": "claude-rotate: every account's window is spent; "
+                                  f"retry in {retry_after}s",
+                       "type": "overloaded_error"}},
+            status_code=503, headers=resp_headers | {"retry-after": str(retry_after)})
+
+    if abody.get("stream") and upstream.status_code == 200 \
+            and "text/event-stream" in upstream.headers.get("content-type", ""):
+        tr = SseToOai()
+
+        async def relay():
+            try:
+                async for chunk in upstream.aiter_bytes():
+                    out = tr.feed(chunk.decode("utf-8", errors="replace"))
+                    if out:
+                        yield out.encode()
+                yield tr.tail().encode()
+            finally:
+                await upstream.aclose()
+                rec["usage"] = summarize_usage(tr.usage)
+                rec["util_5h"] = upstream.headers.get(
+                    "anthropic-ratelimit-unified-5h-utilization")
+                audit(rec)
+                await note_response(account, upstream.headers, upstream.status_code)
+
+        return StreamingResponse(relay(), status_code=200, headers=resp_headers,
+                                 media_type="text/event-stream")
+
+    content = await upstream.aread()
+    await upstream.aclose()
+    if not noted:
+        await note_response(account, upstream.headers, upstream.status_code)
+    rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
+    if upstream.status_code != 200:
+        try:
+            msg = json.loads(content).get("error", {}).get("message") \
+                or content[:200].decode(errors="replace")
+        except (json.JSONDecodeError, AttributeError):
+            msg = content[:200].decode(errors="replace")
+        audit(rec)
+        return JSONResponse({"error": {"message": f"upstream: {msg}",
+                                       "type": "api_error"}},
+                            status_code=upstream.status_code, headers=resp_headers)
+    data = json.loads(content)
+    rec["usage"] = summarize_usage(data.get("usage"))
+    audit(rec)
+    return JSONResponse(anthropic_to_oai(data), headers=resp_headers)
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def proxy(request: Request, path: str):
     device = device_from_request(request)
@@ -542,43 +685,8 @@ async def proxy(request: Request, path: str):
             pass
 
     url = "/" + path + ("?" + str(request.url.query) if request.url.query else "")
-    hold_deadline = time.time() + HOLD_MAX_S if HOLD_MAX_S else None
-    retries = 0
-    noted = False  # note_response already ran for the response we're returning
-    while True:
-        account = STATE["active_account"]
-        fwd_headers["authorization"] = f"Bearer {ACCOUNTS[account]['token']}"
-        pace = STATE["accounts"].get(account, {}).get("pace_until", 0) - time.time()
-        if pace > 0:
-            await asyncio.sleep(min(pace, 60))
-        upstream = await client.send(
-            client.build_request(request.method, url, headers=fwd_headers, content=body),
-            stream=True)
-        if upstream.status_code != 429:
-            break
-        verdict = await note_response(account, upstream.headers, 429)
-        wait = 0.0
-        retry = verdict in ("switched", "burst") and retries < 5
-        if not retry and verdict == "exhausted" and hold_deadline:
-            # Every account is spent: hold the request open until the soonest
-            # window reset instead of failing, so unattended runs finish.
-            wait = min(earliest_relief() + 5, hold_deadline) - time.time()
-            retry = wait > 0
-        if not retry:
-            noted = True
-            break
-        await upstream.aread()
-        await upstream.aclose()
-        retries += 1
-        if wait > 0:
-            async with state_lock:
-                STATE["events"].append({
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "hold",
-                    "from": account, "to": account,
-                    "reason": f"all accounts spent; holding {round(wait)}s"})
-                STATE["events"] = STATE["events"][-200:]
-                save_state()
-            await asyncio.sleep(wait)
+    upstream, account, retries, noted, _verdict = await send_upstream(
+        request.method, url, fwd_headers, body)
 
     rec = {"device": device, "account": account, "path": "/" + path,
            "model": model, "status": upstream.status_code}
@@ -586,6 +694,7 @@ async def proxy(request: Request, path: str):
         rec["retries"] = retries
     resp_headers = {k: v for k, v in upstream.headers.items()
                     if k.lower() not in HOP and k.lower() != "content-encoding"}
+    resp_headers["x-rotate-account"] = account
 
     if "text/event-stream" in upstream.headers.get("content-type", ""):
         usage_acc: dict = {}

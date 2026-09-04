@@ -319,6 +319,24 @@ JSON endpoints: `/rotate/status` (accounts + switch events) and
 `/rotate/stats` (rollups + alerts), same `?key=` or `Authorization: Bearer`
 auth. Audit trail: `logs/audit.jsonl`, one JSON record per request.
 
+## OpenAI-compatible endpoint
+
+`POST /v1/chat/completions` (same device-key auth) accepts OpenAI-format chat
+requests — streaming included — and rides the same rotated accounts, so any
+OpenAI-format app or LLM router can use the capacity, not just Claude Code:
+
+```bash
+curl http://<server>:8484/v1/chat/completions \
+  -H "Authorization: Bearer <device key>" -H "content-type: application/json" \
+  -d '{"model":"claude-sonnet-5","max_tokens":256,
+       "messages":[{"role":"user","content":"hello"}]}'
+```
+
+Text conversations only (tool use → 400). When every account's window is spent
+it returns `503` + `Retry-After: <seconds to earliest reset>` — point a
+router's circuit breaker at that. Responses carry `x-rotate-account` and the
+upstream `anthropic-ratelimit-unified-*` headers for per-request telemetry.
+
 ## Configuration (`config.json`)
 
 | Field | Meaning |
@@ -618,11 +636,18 @@ Roadmap, in intended order:
       in-flight requests during a quota hit, burst storm without rotation,
       20 concurrent held requests, 50 parallel SSE streams, events-list
       bound under churn, aggregate_audit speed on a 50k-row log).
-- [ ] **Exhaustion signal.** When *all* accounts are saturated **and holding
-      is off or exhausted**, return 503 + `Retry-After: <earliest reset>`
-      instead of passing through Anthropic's 429, so upstream routers/breakers
-      can degrade gracefully. (Partially superseded: `hold_max_s` now holds
-      the request open until the soonest reset; the 503 shape is still open.)
+- [x] **OpenAI-compatible endpoint.** `POST /v1/chat/completions` (see its
+      section above): OpenAI ↔ Anthropic translation incl. SSE chunks, in
+      `oai_compat.py` (pure, tested offline in `tests/test_oai_compat.py`);
+      injects `anthropic-version` + `anthropic-beta: oauth-2025-04-20`,
+      forwards NO client headers, refuses tool use with a 400. The rotation
+      loop is shared with the transparent proxy (`send_upstream`).
+- [x] **Exhaustion signal.** The OpenAI endpoint returns 503 +
+      `Retry-After: <earliest reset>` when all accounts are spent (after any
+      `hold_max_s` hold is exhausted) — point a router's breaker at it. The
+      transparent proxy deliberately still passes Anthropic's 429 through:
+      Claude Code handles those natively, and that path's contract is
+      transparency.
 - [ ] **Webhook alerts** (Slack/Teams/generic POST) firing on the same rules
       as the panel's alerts section.
 - [ ] **In-process audit rotation** — roll `logs/audit.jsonl` past a size/age
