@@ -175,6 +175,37 @@ the proxy speaks plain HTTP and device keys are bearer secrets. See
 The proxy is plain HTTP and device keys are bearer secrets, so the transport
 between devices and server must be private. Pick one:
 
+### Same LAN / subnet (nothing to install)
+
+If every device lives on the same trusted network as the server — home lab,
+office LAN — you don't need Tailscale or any overlay at all:
+
+```bash
+# on the server: find its LAN address
+ipconfig getifaddr en0        # macOS (en0 = Ethernet/Wi-Fi)
+hostname -I                   # Linux
+
+# on each device:
+export ANTHROPIC_BASE_URL=http://192.168.1.42:8484
+```
+
+- **macOS servers get a free stable name** via Bonjour/mDNS:
+  `http://<hostname>.local:8484` (e.g. `http://mac-mini.local:8484`) works from
+  Macs, iPhones, and most Linux devices (with `avahi-daemon`) — no IP to
+  remember. Otherwise give the server a **DHCP reservation** in your router so
+  its IP never changes under the devices pointing at it.
+- Set `bind` in `config.json` to the LAN IP (or keep `0.0.0.0` if the box has
+  only one network). Verify from a device: `curl http://<server>:8484/rotate/status?key=<device key>`.
+- **Do not port-forward 8484 on your router.** LAN-only means the firewall
+  boundary is your router's NAT; forwarding the port turns this into the
+  internet-exposed scenario below.
+
+The trust caveat: traffic is plain HTTP, so anyone on the same subnet can read
+device keys off the wire. Fine for a home network you control; on a shared
+office network or anywhere with guests, prefer one of the encrypted options
+below. And a hybrid is normal — LAN for the desktop next to the server,
+Tailscale for the laptop that leaves the house.
+
 ### Tailscale (recommended)
 
 Zero-config WireGuard mesh; free tier covers personal use easily.
