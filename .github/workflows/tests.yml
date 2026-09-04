@@ -27,11 +27,15 @@ jobs:
       - name: Create test fixture config
         # Importing rotator needs a config.json with at least one account
         # whose token file exists. The tests override everything else.
+        # add-device replaces the example's PUBLIC placeholder key — rotator
+        # refuses to boot while one remains (load_config, issue #2), so CI
+        # goes through the same onboarding step a real install does.
         run: |
           cp config.example.json config.json
           mkdir -p tokens logs
           echo "sk-ant-oat01-ci-dummy-token" > tokens/acct-1.token
           echo "sk-ant-oat01-ci-dummy-token" > tokens/acct-2.token
+          ./setup.sh add-device ci-runner
 
       - name: Run test suite
         run: python tests/run_all.py

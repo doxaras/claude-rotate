@@ -1,7 +1,11 @@
 """Offline tests for the OpenAI <-> Anthropic translation layer. No config, no
 network — oai_compat.py imports clean by design.
 
-  python3 -m pytest tests/ -q
+Runs under pytest AND as a plain script (tests/run_all.py executes files with
+the interpreter, so the __main__ block below is what makes these tests count
+there — without it this file is a silent no-op in CI).
+
+  python3 tests/test_oai_compat.py
 """
 import json
 import sys
@@ -127,3 +131,14 @@ def test_sse_translation_survives_arbitrary_chunk_boundaries():
         assert got.rstrip().endswith("data: [DONE]")
         # the accumulated Anthropic-style usage feeds the audit record
         assert tr.usage["output_tokens"] == 7 and tr.usage["input_tokens"] == 12
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    fns = [(n, f) for n, f in sorted(globals().items())
+           if n.startswith("test_") and callable(f)]
+    for n, f in fns:
+        f()
+        print(f"ok   {n}")
+    print(f"{len(fns)} passed")
+    _sys.exit(0)
