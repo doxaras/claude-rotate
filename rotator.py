@@ -65,6 +65,16 @@ def load_config() -> dict:
     if not loaded:
         raise SystemExit("no accounts with tokens configured — run: ./setup.sh add-account <name>")
     cfg["accounts"] = loaded
+    # The example config ships a placeholder device key that is PUBLIC (it's in
+    # the repo). It must never be accepted as a live credential: refuse to start
+    # while one remains, so add-account-without-add-device can't open the proxy
+    # to anyone who read the example (GitHub issue #2).
+    bad = [d for d, k in (cfg.get("devices") or {}).items() if "REPLACE-WITH" in k]
+    if bad:
+        raise SystemExit(
+            f"placeholder device key(s) in config.json: {', '.join(bad)} — the example "
+            "value is public and must never be a valid credential. "
+            "Run: ./setup.sh add-device <name> (it replaces the placeholder).")
     return cfg
 
 

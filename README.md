@@ -16,8 +16,9 @@ own more than one subscription and are tired of "You've hit your session
 limit".
 
 **Herd-safe, by test — not by vibes:** when your whole fleet slams into a rate
-limit at the same instant, exactly *one* rotation happens — 100 in-flight
-requests, 1 switch, 0 stampede. Reproducible numbers in
+limit at the same instant, exactly *one* rotation decision happens — 100
+in-flight requests, 1 switch, and every request recovers with a single retry
+onto the new account. Reproducible numbers in
 [Performance](#performance-herd-safe).
 
 > **Terms-of-Service note.** This tool automates switching between accounts
@@ -71,21 +72,25 @@ Apple-silicon dev machine — run it on yours):
 | Scenario | Result |
 |---|---|
 | 300 concurrent requests | every one served, audit complete, **~3,500 req/s** proxy overhead ceiling |
-| Quota limit hit with **100 requests in flight** | **exactly 1 switch**, only 1 request ever touched the dead account, all 100 recovered |
+| Quota limit hit with **100 requests in flight** (50 ms simulated upstream RTT) | **exactly 1 switch** — the in-flight herd hits the dying account once each (they were already on the wire), then every request retries **once** onto the survivor; all 100 recover |
 | 50 burst-429s across 100 concurrent requests | **0 rotations** — paced on the same account, prompt caches kept warm |
 | All accounts spent, 20 requests arrive | all park via hold-until-reset and release **together** at the window reset |
 | 50 parallel SSE streams | byte-identical relay, usage audited on every stream |
 | 50,000-row audit log | analytics rollup in **0.42 s** |
 
 Why this matters with a fleet: the failure mode of naive rotators under load
-is the stampede — N in-flight requests each trigger their own switch, the
-account pool burns down in seconds, and every device's prompt cache is thrown
-away N times. Here a single lock serializes the decision: one switch, everyone
-else rides it.
+is the *switch* stampede — N in-flight requests each trigger their own switch,
+the account pool burns down in seconds, and every device's prompt cache is
+thrown away N times. Here a single lock serializes the decision: one switch,
+everyone else rides it. To be precise about what the lock can and cannot do:
+requests already on the wire when the quota hits still reach the dying account
+once each — nothing can un-send them — but there is exactly one switch and
+exactly one retry per request, and both counts are asserted in the test.
 
 Honest scope: single process by design (state lives in one place — don't run
-uvicorn workers), and the upstream is mocked, so figures measure the proxy's
-own overhead and race behavior, not Anthropic latency.
+uvicorn workers), and the upstream is mocked (the race test adds 50 ms of
+simulated RTT), so figures measure the proxy's own overhead and race behavior,
+not Anthropic latency.
 
 ## Quickstart (server)
 

@@ -1,5 +1,5 @@
 {
-  "bind": "0.0.0.0",
+  "bind": "127.0.0.1",
   "port": 8484,
   "switch_threshold": 0.8,
   "switch_threshold_7d": 0.98,
@@ -7,7 +7,7 @@
   "switch_cooldown_s": 300,
   "switch_margin": 0.05,
   "consume_first_margin_s": 3600,
-  "hold_max_s": 3600,
+  "hold_max_s": 0,
   "accounts": [
     {
       "name": "acct-1",

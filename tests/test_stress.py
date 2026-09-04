@@ -98,11 +98,18 @@ check("throughput sane (>50 req/s via ASGI+mock)", 300 / secs > 50,
       f"{300 / secs:.0f} req/s")
 
 # --- 2. rotation race: quota 429 mid-storm → exactly ONE switch --------------
+# The upstream has realistic latency (50 ms RTT), so the WHOLE herd is on the
+# wire before the first 429 lands. The lock cannot un-send those — they hit
+# the dying account once each, and that is asserted rather than hidden (GitHub
+# issue #1). What the lock DOES guarantee, and what these checks pin: one
+# switch decision (no switch stampede), and every request retries exactly once
+# onto the survivor — no retry thrash, no second herd.
 fresh_state("a", {"b": {"util_5h": 0.1, "util_7d": 0.1}})
 upstream_calls = {"a": 0, "b": 0}
 
 
-def race_handler(req):
+async def race_handler(req):
+    await asyncio.sleep(0.05)              # herd is fully in flight together
     if req.headers["authorization"] == "Bearer tok-a":
         upstream_calls["a"] += 1
         return httpx.Response(429, json={"error": "limit"},
@@ -117,7 +124,11 @@ switches = [e for e in R.STATE["events"] if e["type"] == "switch"]
 check("100 in-flight during quota hit: all recover to 200",
       all(r.status_code == 200 for r in resps))
 check("exactly one switch event despite 100 racers", len(switches) == 1,
-      f"{len(switches)} switches, {upstream_calls['a']} hits on dead account")
+      f"{len(switches)} switches")
+check("in-flight herd hits the dying account at most once each",
+      1 <= upstream_calls["a"] <= 100, f"{upstream_calls['a']} hits on a")
+check("survivor serves every request exactly once (no retry thrash)",
+      upstream_calls["b"] == 100, f"{upstream_calls['b']} hits on b")
 check("active landed on b", R.STATE["active_account"] == "b")
 check("audit final records all on b",
       all(rec["account"] == "b" for rec in audit_recs()))
