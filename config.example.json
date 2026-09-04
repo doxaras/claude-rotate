@@ -9,22 +9,48 @@
   "consume_first_margin_s": 3600,
   "hold_max_s": 3600,
   "accounts": [
-    { "name": "acct-1", "token_file": "tokens/acct-1.token" },
-    { "name": "acct-2", "token_file": "tokens/acct-2.token" }
+    {
+      "name": "acct-1",
+      "token_file": "tokens/acct-1.token"
+    },
+    {
+      "name": "acct-2",
+      "token_file": "tokens/acct-2.token"
+    }
   ],
   "devices": {
     "my-laptop": "dev-my-laptop-REPLACE-WITH-RANDOM-HEX"
   },
   "prices_per_mtok": {
-    "fable": [10.0, 50.0],
-    "mythos": [10.0, 50.0],
-    "opus": [5.0, 25.0],
-    "sonnet": [3.0, 15.0],
-    "haiku": [1.0, 5.0]
+    "fable": [
+      10.0,
+      50.0
+    ],
+    "mythos": [
+      10.0,
+      50.0
+    ],
+    "opus": [
+      5.0,
+      25.0
+    ],
+    "sonnet": [
+      3.0,
+      15.0
+    ],
+    "haiku": [
+      1.0,
+      5.0
+    ]
   },
   "alerts": {
     "device_tokens_per_hour": 5000000,
-    "expensive_model_patterns": ["opus", "fable", "mythos"],
+    "expensive_model_patterns": [
+      "opus",
+      "fable",
+      "mythos"
+    ],
     "util_warn": 0.8
-  }
+  },
+  "public_url": ""
 }

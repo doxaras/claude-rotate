@@ -5,6 +5,9 @@
 #   ./setup.sh                       first-time init (creates config.json, dirs)
 #   ./setup.sh add-device <name>     mint a device key and register it
 #   ./setup.sh add-account <name>    store a `claude setup-token` for an account
+#   ./setup.sh onboard <user> <dev>  team flow: mint <user>-<dev> key, restart the
+#                                    service, print a paste-ready welcome block
+#                                    (uses config.json "public_url" when set)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -35,9 +38,45 @@ cfg["devices"] = {k: v for k, v in cfg["devices"].items() if "REPLACE-WITH" not 
 cfg["devices"][sys.argv[1]] = sys.argv[2]
 json.dump(cfg, open("config.json", "w"), indent=2)
 EOF
+    url=$(python3 -c "import json; print(json.load(open('config.json')).get('public_url') or 'http://<this-host>:8484')")
     echo "device '$name' registered. On that machine set:"
-    echo "  export ANTHROPIC_BASE_URL=http://<this-host>:8484"
+    echo "  export ANTHROPIC_BASE_URL=$url"
     echo "  export CLAUDE_CODE_OAUTH_TOKEN=$key"
+    ;;
+onboard)
+    # Team flow: a member sends you their username + device name; you run
+    #   ./setup.sh onboard <username> <device>
+    # and paste the printed block back to them. Mints the key as
+    # <username>-<device>, restarts the service so it's live immediately.
+    user="${2:?usage: ./setup.sh onboard <username> <device>  (e.g. onboard maria laptop)}"
+    dev="${3:?usage: ./setup.sh onboard <username> <device>  (e.g. onboard maria laptop)}"
+    name="${user}-${dev}"
+    if python3 -c "import json,sys; sys.exit(0 if '$name' in json.load(open('config.json')).get('devices', {}) else 1)"; then
+        echo "error: device '$name' already exists — revoke it first (delete from config.json) or pick another name" >&2
+        exit 1
+    fi
+    "$0" add-device "$name" > /dev/null
+    key=$(python3 -c "import json; print(json.load(open('config.json'))['devices']['$name'])")
+    url=$(python3 -c "import json; print(json.load(open('config.json')).get('public_url') or 'http://<this-host>:8484')")
+    if command -v systemctl > /dev/null && systemctl is-active --quiet claude-rotate 2> /dev/null; then
+        systemctl restart claude-rotate
+        echo "(service restarted — key is live)"
+    else
+        echo "(restart rotator.py to activate the key)"
+    fi
+    echo
+    echo "──── paste this back to $user ────────────────────────────────"
+    echo "Hi $user — your Claude access for '$dev' is ready."
+    echo
+    echo "Add these two lines to your shell profile (~/.zshrc or ~/.bashrc):"
+    echo
+    echo "  export ANTHROPIC_BASE_URL=$url"
+    echo "  export CLAUDE_CODE_OAUTH_TOKEN=$key"
+    echo
+    echo "Open a new terminal and run 'claude' as usual — no login needed."
+    echo "Usage dashboard: $url/rotate/panel?key=$key"
+    echo "The key is personal to this device — don't share or commit it."
+    echo "──────────────────────────────────────────────────────────────"
     ;;
 add-account)
     name="${2:?usage: ./setup.sh add-account <name>}"
