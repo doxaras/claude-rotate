@@ -59,8 +59,15 @@ onboard)
     key=$(python3 -c "import json; print(json.load(open('config.json'))['devices']['$name'])")
     url=$(python3 -c "import json; print(json.load(open('config.json')).get('public_url') or 'http://<this-host>:8484')")
     if command -v systemctl > /dev/null && systemctl is-active --quiet claude-rotate 2> /dev/null; then
-        systemctl restart claude-rotate
-        echo "(service restarted — key is live)"
+        # non-root operators need sudo for the restart; -n so we fail into the
+        # hint instead of hanging on a password prompt (set -e must not kill
+        # the block before the key is printed)
+        if systemctl restart claude-rotate 2> /dev/null \
+                || sudo -n systemctl restart claude-rotate 2> /dev/null; then
+            echo "(service restarted — key is live)"
+        else
+            echo "(key stored but NOT live — run: sudo systemctl restart claude-rotate)"
+        fi
     else
         echo "(restart rotator.py to activate the key)"
     fi
