@@ -101,12 +101,14 @@ HARD_LIMIT = CFG.get("hard_limit", 1.0)
 RESERVE_SPEND_5H_S = CFG.get("reserve_spend_5h_s", 3600)
 RESERVE_SPEND_7D_S = CFG.get("reserve_spend_7d_s", 43200)
 HOLD_MAX_S = CFG.get("hold_max_s", 0)  # 0 = return 429 when every account is spent
-# A closed/free account (403/404) is marked bad and skipped, but the mark must
-# not be permanent: such states often clear when the account's 5h session/plan
-# window rolls over, and we don't get usable rate-limit headers to pin that on.
-# So an account is reconsidered BAD_RECOVER_S after it was last marked bad, and
-# the next request re-probes it (0 = never reconsider).
-BAD_RECOVER_S = CFG.get("bad_recover_s", 18000)  # default: the 5h session window
+# A closed/free account (403/404) is marked bad and skipped. The mark must not be
+# permanent (a plan can be renewed, a block lifted), so an account is reconsidered
+# BAD_RECOVER_S after it was last marked bad — doubling each time it refuses again
+# (bad_count), capped at BAD_RECOVER_MAX_S — and only a 200 fully clears it.
+# 0 = never reconsider.
+BAD_RECOVER_S = CFG.get("bad_recover_s", 600)
+BAD_RECOVER_MAX_S = CFG.get("bad_recover_max_s", 86400)
+BAD_KEYS = ("bad_status", "last_bad_seen", "bad_count")
 
 
 def load_state() -> dict:
@@ -166,17 +168,31 @@ def account_bad(name: str) -> bool:
     of returning traffic (403 = closed/permission blocked, 404 = model not
     available on this acct, e.g. a free tier asked to serve a premium model).
     Unlike quota rejection this is not a utilisation header, so it is tracked
-    here in state. It stays dead until a rate-limit window resets, the account
-    answers 200 again, or BAD_RECOVER_S elapses since it was marked bad (the
-    closed/free state often clears when the 5h session window rolls over, so we
-    re-probe it on the next request instead of leaving it dead forever)."""
+    here in state. It stays dead until it answers 200 again or bad_recover_wait()
+    elapses since it was last marked bad; after that it is only on probation
+    (see on_probation) and gets re-probed when traffic is forced onto it."""
     info = STATE["accounts"].get(name, {})
     if info.get("bad_status") not in (403, 404):
         return False
-    now, seen = time.time(), info.get("last_bad_seen", 0)
-    if BAD_RECOVER_S and now - seen >= BAD_RECOVER_S:
-        return False
-    return not any(info.get(k) and seen < info[k] <= now for k in ("reset_5h", "reset_7d"))
+    wait = bad_recover_wait(name)
+    return not wait or time.time() - info.get("last_bad_seen", 0) < wait
+
+
+def bad_recover_wait(name: str) -> float:
+    """How long a bad mark holds: BAD_RECOVER_S, doubled for every repeat refusal
+    since the last 200, capped at BAD_RECOVER_MAX_S (0 = forever)."""
+    if not BAD_RECOVER_S:
+        return 0
+    n = max(1, STATE["accounts"].get(name, {}).get("bad_count", 1))
+    return min(BAD_RECOVER_S * 2 ** min(n - 1, 30), max(BAD_RECOVER_MAX_S, BAD_RECOVER_S))
+
+
+def on_probation(name: str) -> bool:
+    """Refused a request (403/404) and has not answered 200 since — whether or
+    not the bad mark has expired. Such an account is only used when traffic is
+    forced off the active one; no voluntary switch moves onto it, so a stale low
+    utilisation can't make a strategy keep re-picking a closed account."""
+    return STATE["accounts"].get(name, {}).get("bad_status") in (403, 404)
 
 
 def under_threshold(name: str) -> bool:
@@ -299,17 +315,34 @@ def pick_account() -> str:
         else:
             key = lambda n: (utilization(n),)
         return min(under, key=lambda n: (
+            on_probation(n),  # a known-refusing account only as a last resort
             priority(n),
             (0, binding_reset(n)) if reserve_spendable(n) else (1, 0),
             key(n)))
     reserve = [n for n in ACCOUNTS if hard_ok(n)]
     if reserve:
-        return min(reserve, key=lambda n: (priority(n), binding_reset(n)))
-    pool = [n for n in ACCOUNTS if not disabled(n) and not account_bad(n)] or [n for n in ACCOUNTS if not disabled(n)]
+        return min(reserve, key=lambda n: (on_probation(n), priority(n), binding_reset(n)))
+    pool = ([n for n in ACCOUNTS if not disabled(n) and not account_bad(n)]
+            or [n for n in ACCOUNTS if not disabled(n)] or list(ACCOUNTS))
     week_ok = [n for n in pool if util_7d(n) < HARD_LIMIT]
     if week_ok:
         return min(week_ok, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
     return min(pool, key=weekly_reset)
+
+
+def record_switch(frm: str, to: str, reason: str, now: float) -> None:
+    """Make `to` the active account and log the switch event. Caller holds
+    state_lock and saves state."""
+    STATE["active_account"] = to
+    STATE["last_switch_ts"] = now
+    STATE["events"].append({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "type": "switch",
+        "from": frm, "to": to,
+        "reason": reason,
+        "util": utilization(frm),
+    })
+    STATE["events"] = STATE["events"][-200:]
 
 
 async def note_response(account: str, headers: httpx.Headers, status: int,
@@ -347,14 +380,16 @@ async def note_response(account: str, headers: httpx.Headers, status: int,
         if status == 200 and info.get("bad_status"):
             # A successful reply means the account can serve again — clear the
             # closed/free marker so it is reconsidered for rotation.
-            info.pop("bad_status", None)
-            info.pop("last_bad_seen", None)
+            for k in BAD_KEYS:
+                info.pop(k, None)
 
         quota_hit = info.get("status") == "rejected" or (
             status == 429 and (utilization(account) >= 1.0 or util_7d(account) >= 1.0))
         if bad:
             # Closed/free account refused the request outright (403/404). Mark it
             # dead so pick_account skips it, and force a hard switch below.
+            # A repeat refusal (re-probe of an expired mark) doubles the wait.
+            info["bad_count"] = info.get("bad_count", 0) + 1 if info.get("bad_status") else 1
             info["bad_status"] = status
             info["last_bad_seen"] = now
             quota_hit = True  # hard stop: immediately rotate to a working account
@@ -401,7 +436,9 @@ async def note_response(account: str, headers: httpx.Headers, status: int,
                             or reserve_spendable(nxt)
                             or utilization(nxt) <= utilization(account) - SWITCH_MARGIN):
                         reason = f"utilization>={THRESHOLD}"
-                elif cooled and usable(nxt) and not over:
+                elif cooled and usable(nxt) and not over and not on_probation(nxt):
+                    # Voluntary moves never land on an account that last refused
+                    # outright — it gets re-probed only when traffic is forced.
                     if priority(nxt) < priority(account):
                         # A preferred account has room again — pull traffic back.
                         reason = "priority_recovery"
@@ -432,16 +469,7 @@ async def note_response(account: str, headers: httpx.Headers, status: int,
                         # switches above may always use the reserve.
                         reason = "weekly_pace"
             if reason:
-                STATE["active_account"] = nxt
-                STATE["last_switch_ts"] = now
-                STATE["events"].append({
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "type": "switch",
-                    "from": account, "to": nxt,
-                    "reason": reason,
-                    "util": utilization(account),
-                })
-                STATE["events"] = STATE["events"][-200:]
+                record_switch(account, nxt, reason, now)
                 verdict = "switched"
             elif quota_hit:
                 verdict = "exhausted"
@@ -484,6 +512,10 @@ async def rotate_status(request: Request):
         info["priority"] = priority(name)
         info["disabled"] = disabled(name)
         info["account_bad"] = account_bad(name)
+        info["on_probation"] = on_probation(name)
+        if account_bad(name) and bad_recover_wait(name):
+            info["bad_recover_in_min"] = max(0, round(
+                (info.get("last_bad_seen", 0) + bad_recover_wait(name) - now) / 60))
         if info.get("reset_5h"):
             info["reset_5h_in_min"] = max(0, round((info["reset_5h"] - now) / 60))
         if info.get("reset_7d"):
@@ -773,8 +805,10 @@ def messages_unusable(upstream, url: str) -> bool:
 
 
 def method_is_messages(url: str) -> bool:
-    """True when the upstream path is the Anthropic /v1/messages endpoint."""
-    return url.startswith("/v1/messages")
+    """True when the upstream path is the Anthropic /v1/messages endpoint itself —
+    not /v1/messages/count_tokens or /v1/messages/batches/..., whose 404s (e.g. an
+    unknown batch id) say nothing about the account."""
+    return url.split("?", 1)[0].rstrip("/") == "/v1/messages"
 
 
 def pick_working() -> str | None:
@@ -785,7 +819,34 @@ def pick_working() -> str | None:
     ok = [n for n in ACCOUNTS if hard_ok(n)]
     if not ok:
         return None
-    return min(ok, key=lambda n: (priority(n), binding_reset(n)))
+    return min(ok, key=lambda n: (on_probation(n), priority(n), binding_reset(n)))
+
+
+async def revert_refusals(refused: dict, start: str, status: int) -> None:
+    """A request ended refused, and every previously healthy account it was
+    tried on refused it with the same 403/404: that is the request's fault
+    (unknown model name, a header the API rejects), not the accounts'. Undo the
+    bad marks it made on those accounts and go back to the account it started
+    on, so one bad request can't take the whole herd out of rotation. Accounts
+    already on probation keep their re-mark."""
+    async with state_lock:
+        for name, prior in refused.items():
+            info = STATE["accounts"].setdefault(name, {})
+            for k in BAD_KEYS:
+                if prior.get(k) is None:
+                    info.pop(k, None)
+                else:
+                    info[k] = prior[k]
+        now = time.time()
+        if STATE["active_account"] != start:
+            record_switch(STATE["active_account"], start, "request_refused_revert", now)
+        STATE["events"].append({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "refusal",
+            "from": start, "to": start,
+            "reason": f"{status} from every account tried ({', '.join(refused)}); "
+                      "treated as a bad request, bad marks reverted"})
+        STATE["events"] = STATE["events"][-200:]
+        save_state()
 
 
 async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
@@ -799,6 +860,10 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
     retries = 0
     noted = False
     verdict = None
+    start = STATE["active_account"]
+    # Accounts that were clean (not on probation) before this request and then
+    # refused it: name -> (their bad-mark fields before, the refusal status).
+    refused: dict = {}
     while True:
         account = STATE["active_account"]
         # Never fire a request at an account we already know is a closed/free
@@ -807,7 +872,9 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
             async with state_lock:
                 good = pick_working()
                 if good is not None and good != STATE["active_account"]:
-                    STATE["active_account"] = good
+                    record_switch(STATE["active_account"], good, "account_unusable",
+                                  time.time())
+                    save_state()
                     account = good
         fwd_headers["authorization"] = f"Bearer {ACCOUNTS[account]['token']}"
         pace = STATE["accounts"].get(account, {}).get("pace_until", 0) - time.time()
@@ -820,12 +887,23 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
             return upstream, account, retries, noted, verdict
         # A 429 (quota/burst) or a /v1/messages refusal on a closed/free account
         # (403 permission-blocked, or 404 model-not-found) both mean: rotate.
-        note_status = 429 if upstream.status_code == 429 else upstream.status_code
-        verdict = await note_response(account, upstream.headers, note_status,
-                                      bad=note_status in (403, 404))
+        note_status = upstream.status_code
+        bad = note_status in (403, 404)
+        if bad and account not in refused and not on_probation(account):
+            info = STATE["accounts"].get(account, {})
+            refused[account] = ({k: info.get(k) for k in BAD_KEYS}, note_status)
+        verdict = await note_response(account, upstream.headers, note_status, bad=bad)
         wait = 0.0
         retry = verdict in ("switched", "burst") and retries < 5
-        if not retry and verdict == "exhausted" and hold_deadline:
+        if (not retry and bad and refused
+                and len({st for _, st in refused.values()}) == 1):
+            # The request ends refused and every account that was healthy before
+            # it refused it the same way: the request is at fault, so don't
+            # leave those accounts marked dead.
+            await revert_refusals({n: p for n, (p, _) in refused.items()}, start,
+                                  next(iter(refused.values()))[1])
+        # Holding only makes sense for spent quota (429), not for refusals.
+        if not retry and verdict == "exhausted" and hold_deadline and not bad:
             # Every account is spent: hold the request open until the soonest
             # window reset instead of failing, so unattended runs finish.
             wait = min(earliest_relief() + 5, hold_deadline) - time.time()

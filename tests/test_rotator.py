@@ -469,4 +469,139 @@ v = run(R.note_response("a", headers(u5=0.1, u7=0.1), 403, bad=True))
 check("still-dead account re-marked after re-probe", R.account_bad("a")
       and R.STATE["active_account"] == "b")
 
+
+# 14. probation: an expired bad mark must not attract voluntary switches.
+# (Live 2026-11-01: weekly-pace moved acct-3 -> dead acct-1 every 10 min.)
+R.BAD_RECOVER_S, R.BAD_RECOVER_MAX_S = 600, 86400
+R.STRATEGY, R.COOLDOWN_S = "weekly-pace", 0
+fresh_state("c")
+t = time.time()
+R.STATE["accounts"] = {
+    "a": {"util_5h": 0.0, "util_7d": 0.0, "reset_7d": t + 3600,
+          "bad_status": 403, "last_bad_seen": t - 700, "bad_count": 1},
+    "b": {"util_5h": 0.0, "util_7d": 0.0, "reset_7d": t + 3600,
+          "bad_status": 404, "last_bad_seen": t - 700, "bad_count": 1},
+    "c": {"util_5h": 0.2, "util_7d": 0.2, "reset_7d": t + 500000},
+}
+check("expired mark: no longer account_bad", not R.account_bad("a"))
+check("expired mark: still on probation", R.on_probation("a"))
+check("pick_account prefers the clean account over probation ones", R.pick_account() == "c")
+v = run(R.note_response("c", headers(u5=0.2, u7=0.2), 200))
+check("weekly-pace makes no voluntary switch onto a probation account",
+      R.STATE["active_account"] == "c" and v is None)
+# ...but a forced move (quota gone on c) may re-probe one
+v = run(R.note_response("c", headers(u5=1.0, u7=0.3, status="rejected"), 429))
+check("forced switch may land on a probation account",
+      v == "switched" and R.STATE["active_account"] in ("a", "b"))
+R.STRATEGY, R.COOLDOWN_S = "consume-first", 300
+
+# 14b. backoff: each repeat refusal doubles the wait; a 200 resets it.
+fresh_state("a")
+R.STATE["accounts"] = {"a": {}, "b": {}, "c": {}}
+run(R.note_response("a", headers(), 403, bad=True))
+check("first refusal: count 1, wait = bad_recover_s",
+      R.STATE["accounts"]["a"]["bad_count"] == 1 and R.bad_recover_wait("a") == 600)
+run(R.note_response("a", headers(), 403, bad=True))
+run(R.note_response("a", headers(), 403, bad=True))
+check("third refusal: wait 4x", R.bad_recover_wait("a") == 2400)
+R.STATE["accounts"]["a"]["bad_count"] = 40
+check("wait capped at bad_recover_max_s", R.bad_recover_wait("a") == 86400)
+run(R.note_response("a", headers(), 200))
+check("200 clears the mark and the backoff",
+      not any(k in R.STATE["accounts"]["a"] for k in R.BAD_KEYS) and not R.on_probation("a"))
+
+# 15. pick_account with every account disabled must not crash.
+fresh_state("a")
+R.STATE["accounts"] = {}
+saved = R.ACCOUNTS
+R.ACCOUNTS = {n: {"name": n, "disabled": True} for n in ("a", "b", "c")}
+try:
+    check("all accounts disabled: pick_account still returns one",
+          R.pick_account() in R.ACCOUNTS)
+finally:
+    R.ACCOUNTS = saved
+
+
+# 16. send_upstream end-to-end against a fake upstream.
+class FakeResp:
+    def __init__(self, status):
+        self.status_code, self.headers = status, H()
+    async def aread(self): return b"{}"
+    async def aclose(self): pass
+
+
+class FakeClient:
+    """Answers per account (keyed by bearer token) from a status table."""
+    def __init__(self, table):
+        self.table, self.calls = table, []
+    def build_request(self, method, url, headers=None, content=None):
+        return dict(headers)["authorization"].split()[-1]
+    async def send(self, token, stream=True):
+        self.calls.append(token)
+        return FakeResp(self.table[token])
+
+
+R.ACCOUNTS = {n: {"name": n, "token": n} for n in ("a", "b", "c")}
+R.HOLD_MAX_S = 0
+
+
+def go(table, url="/v1/messages"):
+    R.client = FakeClient(table)
+    up, acct, retries, noted, verdict = run(R.send_upstream("POST", url, {}, b"{}"))
+    return up.status_code, acct, R.client.calls
+
+
+# 16a. a request-level 404 (e.g. a typo'd model) on every account: marks reverted
+fresh_state("a")
+R.STATE["accounts"] = {"a": {}, "b": {}, "c": {}}
+st, acct, calls = go({"a": 404, "b": 404, "c": 404})
+check("bad model: client gets the 404", st == 404 and len(calls) == 3)
+check("bad model: no account left marked bad",
+      not any(R.on_probation(n) for n in R.ACCOUNTS))
+check("bad model: back on the starting account", R.STATE["active_account"] == "a")
+check("bad model: refusal event logged",
+      R.STATE["events"][-1]["type"] == "refusal")
+
+# 16b. live layout: a=403 (closed), b=404 (free), c works -> marks stick
+fresh_state("a")
+R.STATE["accounts"] = {"a": {}, "b": {}, "c": {}}
+st, acct, calls = go({"a": 403, "b": 404, "c": 200})
+check("real dead accounts: request served by c", st == 200 and acct == "c")
+check("real dead accounts: a and b stay marked",
+      R.account_bad("a") and R.account_bad("b") and not R.on_probation("c"))
+
+# 16c. only-working account + bad request while others are on probation:
+# the healthy account must not be poisoned.
+fresh_state("c")
+t = time.time()
+R.STATE["accounts"] = {
+    "a": {"bad_status": 403, "last_bad_seen": t - 700, "bad_count": 1},
+    "b": {"bad_status": 404, "last_bad_seen": t - 700, "bad_count": 1},
+    "c": {}}
+st, acct, calls = go({"a": 403, "b": 404, "c": 404})
+check("bad request with dead peers: c not left marked", not R.on_probation("c"))
+check("bad request with dead peers: back on c", R.STATE["active_account"] == "c")
+check("probation peers that refused again keep their (bumped) mark",
+      R.STATE["accounts"]["a"].get("bad_count") == 2)
+
+# 16d. pre-send switch off a dead active is logged as an event
+fresh_state("a")
+t = time.time()
+R.STATE["accounts"] = {"a": {"bad_status": 403, "last_bad_seen": t, "bad_count": 1},
+                       "b": {}, "c": {}}
+st, acct, calls = go({"a": 403, "b": 200, "c": 200})
+check("pre-send: dead active skipped, no request fired at it", "a" not in calls)
+check("pre-send: switch recorded",
+      any(e.get("reason") == "account_unusable" and e["from"] == "a"
+          for e in R.STATE["events"]) and R.STATE["last_switch_ts"] > 0)
+
+# 16e. only /v1/messages itself counts; a batches 404 is passed straight through
+fresh_state("a")
+R.STATE["accounts"] = {"a": {}, "b": {}, "c": {}}
+st, acct, calls = go({"a": 404, "b": 200, "c": 200}, url="/v1/messages/batches/xyz")
+check("batches 404: no rotation, nothing marked",
+      st == 404 and calls == ["a"] and not R.on_probation("a"))
+check("query string still counts as /v1/messages",
+      R.method_is_messages("/v1/messages?beta=true"))
+
 print(f"\nall {PASS} checks passed")
