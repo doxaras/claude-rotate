@@ -155,8 +155,22 @@ def disabled(name: str) -> bool:
     return bool(ACCOUNTS[name].get("disabled"))
 
 
+def account_bad(name: str) -> bool:
+    """A dead account: Anthropic refused a /v1/messages request outright instead
+    of returning traffic (403 = closed/permission blocked, 404 = model not
+    available on this acct, e.g. a free tier asked to serve a premium model).
+    Unlike quota rejection this is not a utilisation header, so it is tracked
+    here in state. It stays dead until a rate-limit window resets or the account
+    answers 200 again."""
+    info = STATE["accounts"].get(name, {})
+    if info.get("bad_status") not in (403, 404):
+        return False
+    now, seen = time.time(), info.get("last_bad_seen", 0)
+    return not any(info.get(k) and seen < info[k] <= now for k in ("reset_5h", "reset_7d"))
+
+
 def under_threshold(name: str) -> bool:
-    return (not disabled(name)
+    return (not disabled(name) and not account_bad(name)
             and utilization(name) < THRESHOLD and util_7d(name) < THRESHOLD_7D)
 
 
@@ -170,9 +184,9 @@ def rejected(name: str) -> bool:
 
 
 def hard_ok(name: str) -> bool:
-    """Can still serve a request at all: not disabled, under the hard limit in
-    both windows, not currently rejected."""
-    return (not disabled(name) and not rejected(name)
+    """Can still serve a request at all: not disabled, not a dead/closed account,
+    under the hard limit in both windows, not currently rejected."""
+    return (not disabled(name) and not account_bad(name) and not rejected(name)
             and utilization(name) < HARD_LIMIT and util_7d(name) < HARD_LIMIT)
 
 
@@ -281,15 +295,20 @@ def pick_account() -> str:
     reserve = [n for n in ACCOUNTS if hard_ok(n)]
     if reserve:
         return min(reserve, key=lambda n: (priority(n), binding_reset(n)))
-    pool = [n for n in ACCOUNTS if not disabled(n)] or list(ACCOUNTS)
+    pool = [n for n in ACCOUNTS if not disabled(n) and not account_bad(n)] or [n for n in ACCOUNTS if not disabled(n)]
     week_ok = [n for n in pool if util_7d(n) < HARD_LIMIT]
     if week_ok:
         return min(week_ok, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
     return min(pool, key=weekly_reset)
 
 
-async def note_response(account: str, headers: httpx.Headers, status: int) -> str | None:
+async def note_response(account: str, headers: httpx.Headers, status: int,
+                        bad: bool = False) -> str | None:
     """Update account state from unified rate-limit headers; maybe switch.
+
+    bad: True when this account is a closed/free account (403/404 on messages)
+    — it is marked unusable and a hard switch away is forced, so the very next
+    request (and a mid-stream retry) lands on a working account.
 
     Returns what happened: "burst" (per-minute 429, paced — no rotation),
     "switched" (active account changed, retry can ride it), "exhausted"
@@ -315,8 +334,20 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
         now = time.time()
         info["last_seen"] = now
 
+        if status == 200 and info.get("bad_status"):
+            # A successful reply means the account can serve again — clear the
+            # closed/free marker so it is reconsidered for rotation.
+            info.pop("bad_status", None)
+            info.pop("last_bad_seen", None)
+
         quota_hit = info.get("status") == "rejected" or (
             status == 429 and (utilization(account) >= 1.0 or util_7d(account) >= 1.0))
+        if bad:
+            # Closed/free account refused the request outright (403/404). Mark it
+            # dead so pick_account skips it, and force a hard switch below.
+            info["bad_status"] = status
+            info["last_bad_seen"] = now
+            quota_hit = True  # hard stop: immediately rotate to a working account
         if status == 429 and not quota_hit:
             # Per-minute burst limit, not spent quota. Rotating would just move
             # the burst to the next account and drop its warm prompt cache —
@@ -339,7 +370,9 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
             nxt = pick_account()
             reason = None
             if nxt != account:
-                if quota_hit:
+                if bad:
+                    reason = "account_unusable"  # closed/free acct: leave immediately
+                elif quota_hit:
                     reason = "quota_exhausted"  # hard stop: no cooldown, no margin
                 elif disabled(account):
                     reason = "account_disabled"  # hard rule: leave immediately
@@ -437,6 +470,7 @@ async def rotate_status(request: Request):
         info["effective_util_7d"] = util_7d(name)
         info["priority"] = priority(name)
         info["disabled"] = disabled(name)
+        info["account_bad"] = account_bad(name)
         if info.get("reset_5h"):
             info["reset_5h_in_min"] = max(0, round((info["reset_5h"] - now) / 60))
         if info.get("reset_7d"):
@@ -716,6 +750,20 @@ async def rotate_panel(request: Request):
     return Response(content=PANEL_HTML, media_type="text/html")
 
 
+def messages_unusable(upstream, url: str) -> bool:
+    """A /v1/messages response that signals this account can't do the request at
+    all: 403 (closed / permission-blocked) or 404 (model not available on this
+    account, e.g. a free tier asked to serve a premium model). Quota exhaustion
+    shows up as 429 instead, handled separately."""
+    return (method_is_messages(url)
+            and getattr(upstream, "status_code", None) in (403, 404))
+
+
+def method_is_messages(url: str) -> bool:
+    """True when the upstream path is the Anthropic /v1/messages endpoint."""
+    return url.startswith("/v1/messages")
+
+
 async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
     """The rotation loop shared by the transparent proxy and the OpenAI endpoint:
     pick the active account, pace bursts, retry through switches, optionally hold
@@ -736,9 +784,13 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
         upstream = await client.send(
             client.build_request(method, url, headers=fwd_headers, content=body),
             stream=True)
-        if upstream.status_code != 429:
+        if upstream.status_code != 429 and not messages_unusable(upstream, url):
             return upstream, account, retries, noted, verdict
-        verdict = await note_response(account, upstream.headers, 429)
+        # A 429 (quota/burst) or a /v1/messages refusal on a closed/free account
+        # (403 permission-blocked, or 404 model-not-found) both mean: rotate.
+        note_status = 429 if upstream.status_code == 429 else upstream.status_code
+        verdict = await note_response(account, upstream.headers, note_status,
+                                      bad=note_status in (403, 404))
         wait = 0.0
         retry = verdict in ("switched", "burst") and retries < 5
         if not retry and verdict == "exhausted" and hold_deadline:

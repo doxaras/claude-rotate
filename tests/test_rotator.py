@@ -363,4 +363,44 @@ R.STATE["accounts"]["a"]["util_5h"] = 0.96
 check("...not while 5h reserve is far from its reset", not R.reserve_spendable("a"))
 R.THRESHOLD, R.THRESHOLD_7D, R.STRATEGY = 0.8, 0.98, "consume-first"
 
+# 13. closed / free accounts (403 permission-blocked, 404 model-not-found):
+# marked dead and skipped, and a hard switch away is forced.
+fresh_state("a")
+R.STATE["accounts"] = {"a": {"util_5h": 0.1, "util_7d": 0.1},
+                       "b": {"util_5h": 0.1, "util_7d": 0.1},
+                       "c": {"util_5h": 0.1, "util_7d": 0.1}}
+v = run(R.note_response("a", headers(u5=0.1, u7=0.1), 403, bad=True))
+check("closed account (403) is marked bad", R.account_bad("a"))
+check("closed account (403) forces a switch", v == "switched" and R.STATE["active_account"] != "a")
+check("event reason account_unusable",
+      R.STATE["events"][-1]["reason"] == "account_unusable")
+check("bad account excluded from pick", R.pick_account() not in ("a",))
+check("bad account not hard_ok", not R.hard_ok("a"))
+# a successful reply clears the marker so it can rotate in again later
+v = run(R.note_response("a", headers(u5=0.1, u7=0.1), 200))
+check("success clears closed marker", not R.account_bad("a"))
+
+fresh_state("a")
+R.STATE["accounts"] = {"a": {"util_5h": 0.1, "util_7d": 0.1},
+                       "b": {"util_5h": 0.1, "util_7d": 0.1},
+                       "c": {"util_5h": 0.1, "util_7d": 0.1}}
+v = run(R.note_response("a", headers(u5=0.1, u7=0.1), 404, bad=True))
+check("free-tier model-not-found (404) marked bad", R.account_bad("a"))
+check("404 forces a switch", v == "switched" and R.STATE["active_account"] != "a")
+
+# all accounts bad: no switch possible — nothing better to serve
+fresh_state("a")
+R.STATE["accounts"] = {"a": {"bad_status": 403, "last_bad_seen": now},
+                       "b": {"bad_status": 404, "last_bad_seen": now},
+                       "c": {"bad_status": 403, "last_bad_seen": now}}
+# note_response on a bad active account whose peers are also bad: exhausted
+v = run(R.note_response("a", headers(u5=0.1, u7=0.1), 403, bad=True))
+check("all accounts bad: no rotation, exhausted", v == "exhausted"
+      and R.STATE["active_account"] == "a")
+
+fresh_state("a")
+R.STATE["accounts"] = {"a": {"bad_status": 403, "last_bad_seen": now},
+                       "b": {"bad_status": 404, "last_bad_seen": now}}
+check("bad accounts excluded from usable", not R.usable("a") and not R.usable("b"))
+
 print(f"\nall {PASS} checks passed")
