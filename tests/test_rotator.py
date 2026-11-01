@@ -437,4 +437,36 @@ for n in ("a", "b", "c"):
     R.STATE["accounts"][n]["last_bad_seen"] = now
 check("pick_working None when every account dead", R.pick_working() is None)
 
+# 13e. recovery: the bad mark is not permanent — once the recovery window
+# elapses the account is reconsidered so the next request re-probes it.
+R.BAD_RECOVER_S = 18000
+fresh_state("a")
+t0 = time.time()
+R.STATE["accounts"] = {"a": {"bad_status": 403, "last_bad_seen": t0},
+                       "b": {"bad_status": 404, "last_bad_seen": t0},
+                       "c": {"bad_status": 403, "last_bad_seen": t0}}
+check("freshly marked accounts are bad", all(R.account_bad(n) for n in R.ACCOUNTS)
+      and R.pick_working() is None)
+# advance time past the recovery window (monkeypatch time.time)
+_real_t = time.time
+R.STATE["_now"] = [t0 + 18001]
+time.time = lambda: R.STATE["_now"][0]
+try:
+    check("bad mark recovered after bad_recover_s", not R.account_bad("a"))
+    ok_accounts = [n for n in R.ACCOUNTS if R.hard_ok(n)]
+    check("recovered account is hard_ok again", "a" in ok_accounts and len(ok_accounts) == 3)
+    check("pick_working returns a recovered account", R.pick_working() is not None)
+finally:
+    time.time = _real_t
+# a still-bad reply re-marks it immediately (re-probe loop)
+fresh_state("a")
+R.BAD_RECOVER_S = 18000
+t2 = time.time()
+R.STATE["accounts"] = {"a": {"bad_status": 403, "last_bad_seen": t2},
+                       "b": {"util_5h": 0.1, "util_7d": 0.1},
+                       "c": {"util_5h": 0.1, "util_7d": 0.1}}
+v = run(R.note_response("a", headers(u5=0.1, u7=0.1), 403, bad=True))
+check("still-dead account re-marked after re-probe", R.account_bad("a")
+      and R.STATE["active_account"] == "b")
+
 print(f"\nall {PASS} checks passed")
