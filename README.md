@@ -352,9 +352,14 @@ upstream `anthropic-ratelimit-unified-*` headers for per-request telemetry.
 | `accounts[].disabled` | `true` benches an account: never rotated onto, still shown in the panel |
 | `switch_threshold` | 5h-window utilization that triggers rotation (default 0.8) |
 | `switch_threshold_7d` | weekly-window utilization that makes an account unusable (default 0.98) |
-| `strategy` | `consume-first` (default) or `least-used` — see below |
+| `strategy` | `consume-first` (default), `least-used`, `most-weekly-left` or `weekly-pace` — see below |
 | `switch_cooldown_s` | min seconds between voluntary switches (default 300); hard limits ignore it |
 | `switch_margin` | hysteresis: a threshold switch needs a candidate this much better (default 0.05) |
+| `switch_margin_7d` | `most-weekly-left` proactive switch only if the candidate's weekly utilization is this much lower (default 0.03) |
+| `pace_ratio` | `weekly-pace` proactive switch only if the candidate's pace is this many times the active account's (default 1.25) |
+| `reserve_sessions` | `weekly-pace`: a proactive switch onto a fresh 5h window needs at least this many other accounts (the one being left counts) with room to rotate into (default 1) |
+| `reserve_headroom` | room an account needs left in both its 5h and weekly windows, below their thresholds, to count as somewhere to rotate into (default 0.03) |
+| `accounts[].weight` | `weekly-pace`: relative size of the account's plan, e.g. 4 for a 20x plan beside 5x plans (default 1) |
 | `consume_first_margin_s` | proactive switch only if the candidate's weekly reset is this much sooner (default 3600) |
 | `hold_max_s` | when *every* account is spent, hold the request open up to this long waiting for a window reset instead of returning 429 (default 0 = off) |
 | `prices_per_mtok` | substring-matched `[input, output]` $ per MTok for the cost columns |
@@ -372,6 +377,24 @@ weekly window under `switch_threshold_7d`; a window past its reset counts as
   switches *proactively* (below the threshold) when another usable account's
   weekly reset is at least `consume_first_margin_s` sooner.
 - **`least-used`**: classic — lowest 5h utilization wins.
+- **`most-weekly-left`**: among accounts with 5h room, the one with the
+  **lowest weekly utilization** wins (ties go to lower 5h use). The proxy
+  switches *proactively* when another usable account's weekly utilization is
+  at least `switch_margin_7d` lower, so weekly usage stays balanced and a
+  5h-spent account is left for the one with the most week remaining.
+- **`weekly-pace`**: combines how much is left with how long it has left.
+  Each account scores `weight × (1 − weekly utilization) / hours to weekly
+  reset`: the rate it must be used at from now on so none of it expires.
+  The highest score among accounts with 5h room wins, so quota close to
+  expiring gets spent first. A proactive switch needs a score at least
+  `pace_ratio` times the active account's, and it only starts a fresh 5h
+  window if at least `reserve_sessions` other accounts (the one being left
+  included) still have `reserve_headroom` in both windows, so there is always
+  somewhere to rotate into. Forced switches (5h spent,
+  quota rejected) can use the reserve. `/rotate/status` shows each account's
+  `weekly_pace_pct_per_h` and `fresh_session`.
+- If nothing is usable, the proxy waits on the account whose 5h window resets
+  soonest, skipping week-exhausted accounts (a 5h reset can't help them).
 - A cooldown plus a hysteresis margin stop accounts ping-ponging at the
   threshold; a hard limit (quota actually rejected) always switches
   immediately.
@@ -417,7 +440,9 @@ config, the proxy abandons it on the next response, cooldown or not. Re-enable
 by deleting the flag; both changes need a restart (hot reload is on the roadmap).
 
 Combine with `strategy` for the remaining temperament choice: `consume-first`
-(spend perishable weekly quota first) or `least-used` (spread evenly).
+(spend perishable weekly quota first), `least-used` (spread evenly) or
+`most-weekly-left` (always ride the account with the most weekly quota left) or
+`weekly-pace` (spend the quota likeliest to expire, keeping a fresh session in reserve).
 
 **Design note — why no rules YAML:** a rules engine (per-model routes,
 time-of-day windows, per-device pinning) would add a parser, a second config

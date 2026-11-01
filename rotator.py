@@ -85,11 +85,30 @@ DEVICE_BY_KEY = {v: k for k, v in CFG["devices"].items()}
 ACCOUNTS = {a["name"]: a for a in CFG["accounts"]}
 THRESHOLD = CFG.get("switch_threshold", 0.8)
 THRESHOLD_7D = CFG.get("switch_threshold_7d", 0.98)
-STRATEGY = CFG.get("strategy", "consume-first")  # or "least-used"
+STRATEGY = CFG.get("strategy", "consume-first")  # or "least-used" / "most-weekly-left" / "weekly-pace"
 COOLDOWN_S = CFG.get("switch_cooldown_s", 300)
 SWITCH_MARGIN = CFG.get("switch_margin", 0.05)
+SWITCH_MARGIN_7D = CFG.get("switch_margin_7d", 0.03)  # most-weekly-left hysteresis
+PACE_RATIO = CFG.get("pace_ratio", 1.25)  # weekly-pace hysteresis (multiplicative)
+RESERVE_SESSIONS = CFG.get("reserve_sessions", 1)  # weekly-pace: fallbacks to keep
+RESERVE_HEADROOM = CFG.get("reserve_headroom", 0.03)  # room a fallback needs in both windows
 CF_MARGIN_S = CFG.get("consume_first_margin_s", 3600)
+# Above the switch thresholds an account is held in reserve, not dropped: it
+# stays usable up to HARD_LIMIT (Anthropic rejects at 1.0) for emergencies
+# (nothing else under its thresholds) and is spent on purpose once the window
+# holding it there resets within the spend horizon (use it or lose it).
+HARD_LIMIT = CFG.get("hard_limit", 1.0)
+RESERVE_SPEND_5H_S = CFG.get("reserve_spend_5h_s", 3600)
+RESERVE_SPEND_7D_S = CFG.get("reserve_spend_7d_s", 43200)
 HOLD_MAX_S = CFG.get("hold_max_s", 0)  # 0 = return 429 when every account is spent
+# A closed/free account (403/404) is marked bad and skipped. The mark must not be
+# permanent (a plan can be renewed, a block lifted), so an account is reconsidered
+# BAD_RECOVER_S after it was last marked bad — doubling each time it refuses again
+# (bad_count), capped at BAD_RECOVER_MAX_S — and only a 200 fully clears it.
+# 0 = never reconsider.
+BAD_RECOVER_S = CFG.get("bad_recover_s", 600)
+BAD_RECOVER_MAX_S = CFG.get("bad_recover_max_s", 86400)
+BAD_KEYS = ("bad_status", "last_bad_seen", "bad_count")
 
 
 def load_state() -> dict:
@@ -144,13 +163,116 @@ def disabled(name: str) -> bool:
     return bool(ACCOUNTS[name].get("disabled"))
 
 
-def usable(name: str) -> bool:
-    return (not disabled(name)
+def account_bad(name: str) -> bool:
+    """A dead account: Anthropic refused a /v1/messages request outright instead
+    of returning traffic (403 = closed/permission blocked, 404 = model not
+    available on this acct, e.g. a free tier asked to serve a premium model).
+    Unlike quota rejection this is not a utilisation header, so it is tracked
+    here in state. It stays dead until it answers 200 again or bad_recover_wait()
+    elapses since it was last marked bad; after that it is only on probation
+    (see on_probation) and gets re-probed when traffic is forced onto it."""
+    info = STATE["accounts"].get(name, {})
+    if info.get("bad_status") not in (403, 404):
+        return False
+    wait = bad_recover_wait(name)
+    return not wait or time.time() - info.get("last_bad_seen", 0) < wait
+
+
+def bad_recover_wait(name: str) -> float:
+    """How long a bad mark holds: BAD_RECOVER_S, doubled for every repeat refusal
+    since the last 200, capped at BAD_RECOVER_MAX_S (0 = forever)."""
+    if not BAD_RECOVER_S:
+        return 0
+    n = max(1, STATE["accounts"].get(name, {}).get("bad_count", 1))
+    return min(BAD_RECOVER_S * 2 ** min(n - 1, 30), max(BAD_RECOVER_MAX_S, BAD_RECOVER_S))
+
+
+def on_probation(name: str) -> bool:
+    """Refused a request (403/404) and has not answered 200 since — whether or
+    not the bad mark has expired. Such an account is only used when traffic is
+    forced off the active one; no voluntary switch moves onto it, so a stale low
+    utilisation can't make a strategy keep re-picking a closed account."""
+    return STATE["accounts"].get(name, {}).get("bad_status") in (403, 404)
+
+
+def under_threshold(name: str) -> bool:
+    return (not disabled(name) and not account_bad(name)
             and utilization(name) < THRESHOLD and util_7d(name) < THRESHOLD_7D)
+
+
+def rejected(name: str) -> bool:
+    """Last response said quota rejected, and no window has reset since."""
+    info = STATE["accounts"].get(name, {})
+    if info.get("status") != "rejected":
+        return False
+    now, seen = time.time(), info.get("last_seen", 0)
+    return not any(info.get(k) and seen < info[k] <= now for k in ("reset_5h", "reset_7d"))
+
+
+def hard_ok(name: str) -> bool:
+    """Can still serve a request at all: not disabled, not a dead/closed account,
+    under the hard limit in both windows, not currently rejected."""
+    return (not disabled(name) and not account_bad(name) and not rejected(name)
+            and utilization(name) < HARD_LIMIT and util_7d(name) < HARD_LIMIT)
+
+
+def binding_reset(name: str) -> float:
+    """Reset time of the window with the least room left — when the account's
+    remaining capacity stops being the bottleneck (or is lost, if unused)."""
+    info = STATE["accounts"].get(name, {})
+    room_5h = HARD_LIMIT - utilization(name)
+    room_7d = HARD_LIMIT - util_7d(name)
+    key = "reset_5h" if room_5h <= room_7d else "reset_7d"
+    return info.get(key) or float("inf")
+
+
+def reserve_spendable(name: str) -> bool:
+    """In the reserve band (over a threshold, under the hard limit) and every
+    window holding it there resets within its spend horizon: that reserve is
+    about to be lost unused, so spend it now."""
+    if not hard_ok(name) or under_threshold(name):
+        return False
+    info, now = STATE["accounts"].get(name, {}), time.time()
+    for util, thr, key, horizon in (
+            (utilization(name), THRESHOLD, "reset_5h", RESERVE_SPEND_5H_S),
+            (util_7d(name), THRESHOLD_7D, "reset_7d", RESERVE_SPEND_7D_S)):
+        if util >= thr and not (info.get(key) and info[key] - now <= horizon):
+            return False
+    return True
+
+
+def usable(name: str) -> bool:
+    """Normal traffic may go here: under both thresholds, or reserve that is
+    about to expire."""
+    return under_threshold(name) or reserve_spendable(name)
 
 
 def weekly_reset(name: str) -> float:
     return STATE["accounts"].get(name, {}).get("reset_7d") or float("inf")
+
+
+def weekly_pace(name: str) -> float:
+    """Share of the weekly quota that must be used per hour from now on to not
+    lose any of it: weight * (1 - weekly util) / hours until the weekly reset.
+    Higher = more perishable. An unknown or passed reset counts as a full week;
+    the hours are floored at 1 so the score stays finite near the reset."""
+    left = max(0.0, 1.0 - util_7d(name))
+    reset = STATE["accounts"].get(name, {}).get("reset_7d")
+    now = time.time()
+    hours = (reset - now) / 3600 if reset and reset > now else 168.0
+    return ACCOUNTS[name].get("weight", 1.0) * left / max(hours, 1.0)
+
+
+def fresh_session(name: str) -> bool:
+    """5h window not started (or already reset) — a session to rotate into."""
+    return utilization(name) < 0.01
+
+
+def can_fall_back_to(name: str) -> bool:
+    """Somewhere to rotate into: usable, with real room left in both windows."""
+    return (usable(name)
+            and THRESHOLD - utilization(name) >= RESERVE_HEADROOM
+            and THRESHOLD_7D - util_7d(name) >= RESERVE_HEADROOM)
 
 
 def earliest_relief() -> float:
@@ -169,19 +291,67 @@ def pick_account() -> str:
     consume-first (default): burn the usable account whose weekly window resets
     soonest — weekly quota is use-it-or-lose-it, so spend the perishable one.
     least-used: lowest 5h utilization.
-    If nothing is usable, the non-disabled account whose 5h window resets soonest.
+    most-weekly-left: lowest weekly utilization (most weekly quota left), among
+    accounts that still have 5h session room; ties broken by lower 5h use.
+    weekly-pace: highest weekly_pace() — the account whose remaining weekly
+    quota is likeliest to expire unused; ties broken by lower 5h use.
+    Within a tier, reserve about to expire (reserve_spendable) goes first,
+    soonest reset first — it is lost otherwise.
+    Emergency (nothing usable): the reserve band — any hard_ok account, the one
+    whose binding window resets soonest, so traffic runs to the real limit
+    instead of stopping at the thresholds.
+    If nothing is hard_ok: the non-disabled account whose 5h window resets
+    soonest, skipping week-exhausted accounts (a 5h reset doesn't help them);
+    if every account is week-exhausted, the one whose weekly window resets soonest.
     """
     under = [n for n in ACCOUNTS if usable(n)]
     if under:
         if STRATEGY == "consume-first":
-            return min(under, key=lambda n: (priority(n), weekly_reset(n), utilization(n)))
-        return min(under, key=lambda n: (priority(n), utilization(n)))
-    pool = [n for n in ACCOUNTS if not disabled(n)] or list(ACCOUNTS)
-    return min(pool, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
+            key = lambda n: (weekly_reset(n), utilization(n))
+        elif STRATEGY == "most-weekly-left":
+            key = lambda n: (util_7d(n), utilization(n))
+        elif STRATEGY == "weekly-pace":
+            key = lambda n: (-weekly_pace(n), utilization(n))
+        else:
+            key = lambda n: (utilization(n),)
+        return min(under, key=lambda n: (
+            on_probation(n),  # a known-refusing account only as a last resort
+            priority(n),
+            (0, binding_reset(n)) if reserve_spendable(n) else (1, 0),
+            key(n)))
+    reserve = [n for n in ACCOUNTS if hard_ok(n)]
+    if reserve:
+        return min(reserve, key=lambda n: (on_probation(n), priority(n), binding_reset(n)))
+    pool = ([n for n in ACCOUNTS if not disabled(n) and not account_bad(n)]
+            or [n for n in ACCOUNTS if not disabled(n)] or list(ACCOUNTS))
+    week_ok = [n for n in pool if util_7d(n) < HARD_LIMIT]
+    if week_ok:
+        return min(week_ok, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
+    return min(pool, key=weekly_reset)
 
 
-async def note_response(account: str, headers: httpx.Headers, status: int) -> str | None:
+def record_switch(frm: str, to: str, reason: str, now: float) -> None:
+    """Make `to` the active account and log the switch event. Caller holds
+    state_lock and saves state."""
+    STATE["active_account"] = to
+    STATE["last_switch_ts"] = now
+    STATE["events"].append({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "type": "switch",
+        "from": frm, "to": to,
+        "reason": reason,
+        "util": utilization(frm),
+    })
+    STATE["events"] = STATE["events"][-200:]
+
+
+async def note_response(account: str, headers: httpx.Headers, status: int,
+                        bad: bool = False) -> str | None:
     """Update account state from unified rate-limit headers; maybe switch.
+
+    bad: True when this account is a closed/free account (403/404 on messages)
+    — it is marked unusable and a hard switch away is forced, so the very next
+    request (and a mid-stream retry) lands on a working account.
 
     Returns what happened: "burst" (per-minute 429, paced — no rotation),
     "switched" (active account changed, retry can ride it), "exhausted"
@@ -207,8 +377,22 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
         now = time.time()
         info["last_seen"] = now
 
+        if status == 200 and info.get("bad_status"):
+            # A successful reply means the account can serve again — clear the
+            # closed/free marker so it is reconsidered for rotation.
+            for k in BAD_KEYS:
+                info.pop(k, None)
+
         quota_hit = info.get("status") == "rejected" or (
             status == 429 and (utilization(account) >= 1.0 or util_7d(account) >= 1.0))
+        if bad:
+            # Closed/free account refused the request outright (403/404). Mark it
+            # dead so pick_account skips it, and force a hard switch below.
+            # A repeat refusal (re-probe of an expired mark) doubles the wait.
+            info["bad_count"] = info.get("bad_count", 0) + 1 if info.get("bad_status") else 1
+            info["bad_status"] = status
+            info["last_bad_seen"] = now
+            quota_hit = True  # hard stop: immediately rotate to a working account
         if status == 429 and not quota_hit:
             # Per-minute burst limit, not spent quota. Rotating would just move
             # the burst to the next account and drop its warm prompt cache —
@@ -227,43 +411,65 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
             verdict = "switched" if quota_hit else None
         else:
             cooled = now - STATE.get("last_switch_ts", 0) >= COOLDOWN_S
-            over = utilization(account) >= THRESHOLD or util_7d(account) >= THRESHOLD_7D
+            over = not usable(account)  # expiring reserve is being spent on purpose
             nxt = pick_account()
             reason = None
             if nxt != account:
-                if quota_hit:
+                if bad:
+                    # Only rotate to an account that can actually serve now.
+                    # If every other account is also dead (all bad), stay put and
+                    # surface the refusal instead of bouncing between dead ones.
+                    reason = "account_unusable" if hard_ok(nxt) else None
+                elif quota_hit:
                     reason = "quota_exhausted"  # hard stop: no cooldown, no margin
                 elif disabled(account):
                     reason = "account_disabled"  # hard rule: leave immediately
-                elif over and cooled:
+                elif over and cooled and (usable(nxt) or not hard_ok(account)):
                     # Hysteresis: only move to a meaningfully better account, so
                     # two accounts hovering at the line never ping-pong. A move
-                    # to a preferred tier, or off a week-exhausted account,
-                    # skips the margin.
+                    # to a preferred tier, off a week-exhausted account, or onto
+                    # expiring reserve skips the margin. If nxt is itself only
+                    # reserve (emergency), stay put: the active account keeps
+                    # its warm cache until it is actually rejected.
                     if (util_7d(account) >= THRESHOLD_7D
                             or priority(nxt) < priority(account)
+                            or reserve_spendable(nxt)
                             or utilization(nxt) <= utilization(account) - SWITCH_MARGIN):
                         reason = f"utilization>={THRESHOLD}"
-                elif cooled and usable(nxt):
+                elif cooled and usable(nxt) and not over and not on_probation(nxt):
+                    # Voluntary moves never land on an account that last refused
+                    # outright — it gets re-probed only when traffic is forced.
                     if priority(nxt) < priority(account):
                         # A preferred account has room again — pull traffic back.
                         reason = "priority_recovery"
+                    elif reserve_spendable(nxt) and not reserve_spendable(account):
+                        # Another account's last few % reset soon — spend them
+                        # before they are lost; come back when it is rejected.
+                        reason = "reserve_expiring"
                     elif (STRATEGY == "consume-first"
                           and weekly_reset(nxt) < weekly_reset(account) - CF_MARGIN_S):
                         # Use-it-or-lose-it: proactively jump to an account whose
                         # weekly window expires clearly sooner than the active one's.
                         reason = "consume_first"
+                    elif (STRATEGY == "most-weekly-left"
+                          and util_7d(nxt) <= util_7d(account) - SWITCH_MARGIN_7D):
+                        # Proactively move to the account with clearly more weekly
+                        # quota left; the margin stops near-equal accounts churning
+                        # (each switch costs the warm prompt cache).
+                        reason = "most_weekly_left"
+                    elif (STRATEGY == "weekly-pace"
+                          and weekly_pace(nxt) >= weekly_pace(account) * PACE_RATIO
+                          and (not fresh_session(nxt)
+                               or sum(can_fall_back_to(n) for n in ACCOUNTS if n != nxt)
+                               >= RESERVE_SESSIONS)):
+                        # Proactively move to clearly more perishable quota — but a
+                        # voluntary move must not start a fresh 5h window unless
+                        # somewhere else (the account being left counts) still has
+                        # room to rotate into when the new session runs out. Forced
+                        # switches above may always use the reserve.
+                        reason = "weekly_pace"
             if reason:
-                STATE["active_account"] = nxt
-                STATE["last_switch_ts"] = now
-                STATE["events"].append({
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "type": "switch",
-                    "from": account, "to": nxt,
-                    "reason": reason,
-                    "util": utilization(account),
-                })
-                STATE["events"] = STATE["events"][-200:]
+                record_switch(account, nxt, reason, now)
                 verdict = "switched"
             elif quota_hit:
                 verdict = "exhausted"
@@ -305,15 +511,25 @@ async def rotate_status(request: Request):
         info["effective_util_7d"] = util_7d(name)
         info["priority"] = priority(name)
         info["disabled"] = disabled(name)
+        info["account_bad"] = account_bad(name)
+        info["on_probation"] = on_probation(name)
+        if account_bad(name) and bad_recover_wait(name):
+            info["bad_recover_in_min"] = max(0, round(
+                (info.get("last_bad_seen", 0) + bad_recover_wait(name) - now) / 60))
         if info.get("reset_5h"):
             info["reset_5h_in_min"] = max(0, round((info["reset_5h"] - now) / 60))
         if info.get("reset_7d"):
             info["reset_7d_in_h"] = max(0, round((info["reset_7d"] - now) / 3600, 1))
+        info["weekly_pace_pct_per_h"] = round(weekly_pace(name) * 100, 3)
+        info["fresh_session"] = fresh_session(name)
+        info["hard_ok"] = hard_ok(name)
+        info["reserve_spendable"] = reserve_spendable(name)
         accounts[name] = info
     return {
         "active_account": STATE["active_account"],
         "switch_threshold": THRESHOLD,
         "switch_threshold_7d": THRESHOLD_7D,
+        "hard_limit": HARD_LIMIT,
         "strategy": STRATEGY,
         "hold_max_s": HOLD_MAX_S,
         "accounts": accounts,
@@ -579,6 +795,60 @@ async def rotate_panel(request: Request):
     return Response(content=PANEL_HTML, media_type="text/html")
 
 
+def messages_unusable(upstream, url: str) -> bool:
+    """A /v1/messages response that signals this account can't do the request at
+    all: 403 (closed / permission-blocked) or 404 (model not available on this
+    account, e.g. a free tier asked to serve a premium model). Quota exhaustion
+    shows up as 429 instead, handled separately."""
+    return (method_is_messages(url)
+            and getattr(upstream, "status_code", None) in (403, 404))
+
+
+def method_is_messages(url: str) -> bool:
+    """True when the upstream path is the Anthropic /v1/messages endpoint itself —
+    not /v1/messages/count_tokens or /v1/messages/batches/..., whose 404s (e.g. an
+    unknown batch id) say nothing about the account."""
+    return url.split("?", 1)[0].rstrip("/") == "/v1/messages"
+
+
+def pick_working() -> str | None:
+    """The best account that can actually serve right now, or None if none.
+    Distinguishes 'a dead account and at least one other works' (return the good
+    one) from 'every account is dead' (None) — so the next request isn't fired
+    at a closed/free account when a working one is idle."""
+    ok = [n for n in ACCOUNTS if hard_ok(n)]
+    if not ok:
+        return None
+    return min(ok, key=lambda n: (on_probation(n), priority(n), binding_reset(n)))
+
+
+async def revert_refusals(refused: dict, start: str, status: int) -> None:
+    """A request ended refused, and every previously healthy account it was
+    tried on refused it with the same 403/404: that is the request's fault
+    (unknown model name, a header the API rejects), not the accounts'. Undo the
+    bad marks it made on those accounts and go back to the account it started
+    on, so one bad request can't take the whole herd out of rotation. Accounts
+    already on probation keep their re-mark."""
+    async with state_lock:
+        for name, prior in refused.items():
+            info = STATE["accounts"].setdefault(name, {})
+            for k in BAD_KEYS:
+                if prior.get(k) is None:
+                    info.pop(k, None)
+                else:
+                    info[k] = prior[k]
+        now = time.time()
+        if STATE["active_account"] != start:
+            record_switch(STATE["active_account"], start, "request_refused_revert", now)
+        STATE["events"].append({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "refusal",
+            "from": start, "to": start,
+            "reason": f"{status} from every account tried ({', '.join(refused)}); "
+                      "treated as a bad request, bad marks reverted"})
+        STATE["events"] = STATE["events"][-200:]
+        save_state()
+
+
 async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
     """The rotation loop shared by the transparent proxy and the OpenAI endpoint:
     pick the active account, pace bursts, retry through switches, optionally hold
@@ -590,8 +860,22 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
     retries = 0
     noted = False
     verdict = None
+    start = STATE["active_account"]
+    # Accounts that were clean (not on probation) before this request and then
+    # refused it: name -> (their bad-mark fields before, the refusal status).
+    refused: dict = {}
     while True:
         account = STATE["active_account"]
+        # Never fire a request at an account we already know is a closed/free
+        # dead-end when a working account is available — leave before sending.
+        if account_bad(account):
+            async with state_lock:
+                good = pick_working()
+                if good is not None and good != STATE["active_account"]:
+                    record_switch(STATE["active_account"], good, "account_unusable",
+                                  time.time())
+                    save_state()
+                    account = good
         fwd_headers["authorization"] = f"Bearer {ACCOUNTS[account]['token']}"
         pace = STATE["accounts"].get(account, {}).get("pace_until", 0) - time.time()
         if pace > 0:
@@ -599,12 +883,27 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
         upstream = await client.send(
             client.build_request(method, url, headers=fwd_headers, content=body),
             stream=True)
-        if upstream.status_code != 429:
+        if upstream.status_code != 429 and not messages_unusable(upstream, url):
             return upstream, account, retries, noted, verdict
-        verdict = await note_response(account, upstream.headers, 429)
+        # A 429 (quota/burst) or a /v1/messages refusal on a closed/free account
+        # (403 permission-blocked, or 404 model-not-found) both mean: rotate.
+        note_status = upstream.status_code
+        bad = note_status in (403, 404)
+        if bad and account not in refused and not on_probation(account):
+            info = STATE["accounts"].get(account, {})
+            refused[account] = ({k: info.get(k) for k in BAD_KEYS}, note_status)
+        verdict = await note_response(account, upstream.headers, note_status, bad=bad)
         wait = 0.0
         retry = verdict in ("switched", "burst") and retries < 5
-        if not retry and verdict == "exhausted" and hold_deadline:
+        if (not retry and bad and refused
+                and len({st for _, st in refused.values()}) == 1):
+            # The request ends refused and every account that was healthy before
+            # it refused it the same way: the request is at fault, so don't
+            # leave those accounts marked dead.
+            await revert_refusals({n: p for n, (p, _) in refused.items()}, start,
+                                  next(iter(refused.values()))[1])
+        # Holding only makes sense for spent quota (429), not for refusals.
+        if not retry and verdict == "exhausted" and hold_deadline and not bad:
             # Every account is spent: hold the request open until the soonest
             # window reset instead of failing, so unattended runs finish.
             wait = min(earliest_relief() + 5, hold_deadline) - time.time()
