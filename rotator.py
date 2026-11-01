@@ -371,7 +371,10 @@ async def note_response(account: str, headers: httpx.Headers, status: int,
             reason = None
             if nxt != account:
                 if bad:
-                    reason = "account_unusable"  # closed/free acct: leave immediately
+                    # Only rotate to an account that can actually serve now.
+                    # If every other account is also dead (all bad), stay put and
+                    # surface the refusal instead of bouncing between dead ones.
+                    reason = "account_unusable" if hard_ok(nxt) else None
                 elif quota_hit:
                     reason = "quota_exhausted"  # hard stop: no cooldown, no margin
                 elif disabled(account):
@@ -764,6 +767,17 @@ def method_is_messages(url: str) -> bool:
     return url.startswith("/v1/messages")
 
 
+def pick_working() -> str | None:
+    """The best account that can actually serve right now, or None if none.
+    Distinguishes 'a dead account and at least one other works' (return the good
+    one) from 'every account is dead' (None) — so the next request isn't fired
+    at a closed/free account when a working one is idle."""
+    ok = [n for n in ACCOUNTS if hard_ok(n)]
+    if not ok:
+        return None
+    return min(ok, key=lambda n: (priority(n), binding_reset(n)))
+
+
 async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
     """The rotation loop shared by the transparent proxy and the OpenAI endpoint:
     pick the active account, pace bursts, retry through switches, optionally hold
@@ -777,6 +791,14 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
     verdict = None
     while True:
         account = STATE["active_account"]
+        # Never fire a request at an account we already know is a closed/free
+        # dead-end when a working account is available — leave before sending.
+        if account_bad(account):
+            async with state_lock:
+                good = pick_working()
+                if good is not None and good != STATE["active_account"]:
+                    STATE["active_account"] = good
+                    account = good
         fwd_headers["authorization"] = f"Bearer {ACCOUNTS[account]['token']}"
         pace = STATE["accounts"].get(account, {}).get("pace_until", 0) - time.time()
         if pace > 0:

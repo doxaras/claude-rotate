@@ -403,4 +403,38 @@ R.STATE["accounts"] = {"a": {"bad_status": 403, "last_bad_seen": now},
                        "b": {"bad_status": 404, "last_bad_seen": now}}
 check("bad accounts excluded from usable", not R.usable("a") and not R.usable("b"))
 
+# 13b. bounce prevention: a bad active must not flip to another DEAD account.
+fresh_state("a")
+# a is active and bad; its two peers are also bad -> no switch, exhausted
+R.STATE["accounts"] = {"a": {"bad_status": 403, "last_bad_seen": now},
+                       "b": {"bad_status": 404, "last_bad_seen": now},
+                       "c": {"bad_status": 403, "last_bad_seen": now}}
+# manually set active=a which is bad; a new 403 must NOT rotate to the dead b/c
+v = run(R.note_response("a", headers(u5=0.1, u7=0.1), 403, bad=True))
+check("dead active with dead peers: no bounce", v == "exhausted"
+      and R.STATE["active_account"] == "a")
+
+# 13c. a dead active SHOULD leave for a genuinely working peer.
+fresh_state("a")
+R.STATE["accounts"] = {
+    "a": {"bad_status": 403, "last_bad_seen": now},
+    "b": {"bad_status": 404, "last_bad_seen": now},
+    "c": {"util_5h": 0.1, "util_7d": 0.1},   # the one working account
+}
+v = run(R.note_response("a", headers(u5=0.1, u7=0.1), 403, bad=True))
+check("dead active leaves for a working peer", v == "switched"
+      and R.STATE["active_account"] == "c")
+check("dead active does not jump to another dead peer", R.STATE["active_account"] != "b")
+
+# 13d. pick_working(): prefers a working account, None when all accounts dead.
+fresh_state("a")
+R.STATE["accounts"] = {"a": {"bad_status": 403, "last_bad_seen": now},
+                       "b": {"util_5h": 0.1, "util_7d": 0.1},
+                       "c": {"util_5h": 0.1, "util_7d": 0.1}}
+check("pick_working chooses the working account", R.pick_working() == "b")
+for n in ("a", "b", "c"):
+    R.STATE["accounts"][n]["bad_status"] = 403
+    R.STATE["accounts"][n]["last_bad_seen"] = now
+check("pick_working None when every account dead", R.pick_working() is None)
+
 print(f"\nall {PASS} checks passed")
