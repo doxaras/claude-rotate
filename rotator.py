@@ -101,6 +101,12 @@ HARD_LIMIT = CFG.get("hard_limit", 1.0)
 RESERVE_SPEND_5H_S = CFG.get("reserve_spend_5h_s", 3600)
 RESERVE_SPEND_7D_S = CFG.get("reserve_spend_7d_s", 43200)
 HOLD_MAX_S = CFG.get("hold_max_s", 0)  # 0 = return 429 when every account is spent
+# A closed/free account (403/404) is marked bad and skipped, but the mark must
+# not be permanent: such states often clear when the account's 5h session/plan
+# window rolls over, and we don't get usable rate-limit headers to pin that on.
+# So an account is reconsidered BAD_RECOVER_S after it was last marked bad, and
+# the next request re-probes it (0 = never reconsider).
+BAD_RECOVER_S = CFG.get("bad_recover_s", 18000)  # default: the 5h session window
 
 
 def load_state() -> dict:
@@ -160,12 +166,16 @@ def account_bad(name: str) -> bool:
     of returning traffic (403 = closed/permission blocked, 404 = model not
     available on this acct, e.g. a free tier asked to serve a premium model).
     Unlike quota rejection this is not a utilisation header, so it is tracked
-    here in state. It stays dead until a rate-limit window resets or the account
-    answers 200 again."""
+    here in state. It stays dead until a rate-limit window resets, the account
+    answers 200 again, or BAD_RECOVER_S elapses since it was marked bad (the
+    closed/free state often clears when the 5h session window rolls over, so we
+    re-probe it on the next request instead of leaving it dead forever)."""
     info = STATE["accounts"].get(name, {})
     if info.get("bad_status") not in (403, 404):
         return False
     now, seen = time.time(), info.get("last_bad_seen", 0)
+    if BAD_RECOVER_S and now - seen >= BAD_RECOVER_S:
+        return False
     return not any(info.get(k) and seen < info[k] <= now for k in ("reset_5h", "reset_7d"))
 
 
