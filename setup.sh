@@ -5,6 +5,7 @@
 #   ./setup.sh                       first-time init (creates config.json, dirs)
 #   ./setup.sh add-device <name>     mint a device key and register it
 #   ./setup.sh add-account <name>    store a `claude setup-token` for an account
+#   ./setup.sh add-codex-account <n> device-login a ChatGPT plan for image generation
 #   ./setup.sh onboard <user> <dev>  team flow: mint <user>-<dev> key, restart the
 #                                    service, print a paste-ready welcome block
 #                                    (uses config.json "public_url" when set)
@@ -101,6 +102,27 @@ if not any(a["name"] == sys.argv[1] for a in cfg["accounts"]):
 json.dump(cfg, open("config.json", "w"), indent=2)
 EOF
     echo "account '$name' stored. Restart rotator.py to load it."
+    ;;
+add-codex-account)
+    # ChatGPT-plan account for /v1/images/generations. Codex has no long-lived
+    # token on Plus/Pro, so each account gets its own CODEX_HOME with a device
+    # login that Codex refreshes itself. Never copy another machine's auth.json:
+    # both copies rotate the same refresh token and sign each other out.
+    name="${2:?usage: ./setup.sh add-codex-account <name>}"
+    command -v codex > /dev/null || { echo "error: codex CLI not on PATH (npm i -g @openai/codex)" >&2; exit 1; }
+    mkdir -p "codex/${name}"
+    chmod 700 codex "codex/${name}"
+    echo "Turn on 'device code sign-in for Codex' in ChatGPT → Settings → Security first."
+    CODEX_HOME="codex/${name}" codex login --device-auth
+    python3 - "$name" <<'EOF'
+import json, sys
+cfg = json.load(open("config.json"))
+cfg.setdefault("codex_accounts", [])
+if not any(a["name"] == sys.argv[1] for a in cfg["codex_accounts"]):
+    cfg["codex_accounts"].append({"name": sys.argv[1], "codex_home": f"codex/{sys.argv[1]}"})
+json.dump(cfg, open("config.json", "w"), indent=2)
+EOF
+    echo "codex account '$name' stored. Restart rotator.py to load it."
     ;;
 *)
     echo "unknown subcommand: $1" >&2; exit 1 ;;

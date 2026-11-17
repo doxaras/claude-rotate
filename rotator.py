@@ -35,6 +35,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+import codex_image
 from oai_compat import SseToOai, anthropic_to_oai, oai_to_anthropic
 
 ROOT = Path(__file__).parent
@@ -64,9 +65,22 @@ def load_config() -> dict:
         else:
             print(f"warning: skipping account '{acct['name']}' — {acct['token_file']} not found",
                   file=sys.stderr)
-    if not loaded:
-        raise SystemExit("no accounts with tokens configured — run: ./setup.sh add-account <name>")
     cfg["accounts"] = loaded
+    codex = []
+    for acct in cfg.get("codex_accounts") or []:
+        home = Path(acct["codex_home"]).expanduser()
+        if not home.is_absolute():
+            home = ROOT / home
+        if (home / "auth.json").exists():
+            acct["codex_home"] = str(home)
+            codex.append(acct)
+        else:
+            print(f"warning: skipping codex account '{acct['name']}' — no auth.json in "
+                  f"{home} (run: ./setup.sh add-codex-account {acct['name']})",
+                  file=sys.stderr)
+    cfg["codex_accounts"] = codex
+    if not loaded and not codex:
+        raise SystemExit("no accounts with tokens configured — run: ./setup.sh add-account <name>")
     # The example config ships a placeholder device key that is PUBLIC (it's in
     # the repo). It must never be accepted as a live credential: refuse to start
     # while one remains, so add-account-without-add-device can't open the proxy
@@ -90,16 +104,23 @@ COOLDOWN_S = CFG.get("switch_cooldown_s", 300)
 SWITCH_MARGIN = CFG.get("switch_margin", 0.05)
 CF_MARGIN_S = CFG.get("consume_first_margin_s", 3600)
 HOLD_MAX_S = CFG.get("hold_max_s", 0)  # 0 = return 429 when every account is spent
+CODEX_ACCOUNTS = {a["name"]: a for a in CFG["codex_accounts"]}
+CODEX_CFG = CFG.get("codex", {})
+# Each image is a `codex exec` process (~40s); cap how many run at once.
+codex_slots = asyncio.Semaphore(CODEX_CFG.get("concurrency", 2))
 
 
 def load_state() -> dict:
     if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text())
-    return {
-        "active_account": CFG["accounts"][0]["name"],
-        "accounts": {a["name"]: {} for a in CFG["accounts"]},
-        "events": [],
-    }
+        state = json.loads(STATE_PATH.read_text())
+    else:
+        state = {
+            "active_account": CFG["accounts"][0]["name"] if CFG["accounts"] else None,
+            "accounts": {a["name"]: {} for a in CFG["accounts"]},
+            "events": [],
+        }
+    state.setdefault("codex", {})
+    return state
 
 
 STATE = load_state()
@@ -317,6 +338,11 @@ async def rotate_status(request: Request):
         "strategy": STRATEGY,
         "hold_max_s": HOLD_MAX_S,
         "accounts": accounts,
+        "codex_accounts": {
+            name: dict(STATE.setdefault("codex", {}).get(name, {}),
+                       usable=codex_image.usable(name, CODEX_ACCOUNTS, STATE["codex"],
+                                                 THRESHOLD, THRESHOLD_7D, now))
+            for name in CODEX_ACCOUNTS},
         "recent_events": STATE["events"][-10:],
     }
 
@@ -639,6 +665,9 @@ async def openai_chat(request: Request):
     if device is None:
         return JSONResponse({"error": {"message": "claude-rotate: unknown device key",
                                        "type": "authentication_error"}}, status_code=401)
+    if not ACCOUNTS:
+        return JSONResponse({"error": {"message": "claude-rotate: no claude accounts configured",
+                                       "type": "invalid_request_error"}}, status_code=503)
     try:
         oai = json.loads(await request.body())
     except json.JSONDecodeError:
@@ -720,6 +749,70 @@ async def openai_chat(request: Request):
     return JSONResponse(anthropic_to_oai(data), headers=resp_headers)
 
 
+@app.post("/v1/images/generations")
+async def openai_images(request: Request):
+    """OpenAI-compatible image endpoint (Phase 4) backed by ChatGPT-plan Codex
+    accounts — see codex_image.py. One image per call, b64_json only (there is
+    nowhere to host a URL). Every account spent -> 503 + Retry-After, same
+    breaker-friendly contract as /v1/chat/completions."""
+    device = device_from_request(request)
+    if device is None:
+        return JSONResponse({"error": {"message": "claude-rotate: unknown device key",
+                                       "type": "authentication_error"}}, status_code=401)
+    if not CODEX_ACCOUNTS:
+        return JSONResponse({"error": {"message": "claude-rotate: no codex accounts "
+                                                  "configured (./setup.sh add-codex-account)",
+                                       "type": "invalid_request_error"}}, status_code=503)
+    try:
+        body = json.loads(await request.body())
+    except json.JSONDecodeError:
+        return JSONResponse({"error": {"message": "body is not valid JSON",
+                                       "type": "invalid_request_error"}}, status_code=400)
+    prompt = (body.get("prompt") or "").strip()
+    if not prompt:
+        return JSONResponse({"error": {"message": "prompt is required",
+                                       "type": "invalid_request_error"}}, status_code=400)
+    if body.get("response_format", "b64_json") != "b64_json":
+        return JSONResponse({"error": {"message": "only response_format=b64_json is supported",
+                                       "type": "invalid_request_error"}}, status_code=400)
+
+    async with codex_slots:
+        result = await codex_image.generate(
+            prompt, body.get("size"), accounts=CODEX_ACCOUNTS,
+            state=STATE.setdefault("codex", {}), runner=codex_image.run_codex,
+            codex_bin=CODEX_CFG.get("bin", "codex"),
+            model=CODEX_CFG.get("model", "gpt-6.1-sol"),
+            effort=CODEX_CFG.get("reasoning_effort", "low"),
+            timeout_s=CODEX_CFG.get("timeout_s", 300),
+            threshold=THRESHOLD, threshold_7d=THRESHOLD_7D)
+    async with state_lock:
+        save_state()
+
+    rec = {"device": device, "account": result["account"], "path": "/v1/images/generations",
+           "model": CODEX_CFG.get("model", "gpt-6.1-sol"), "kind": "image",
+           "elapsed_s": result["elapsed_s"]}
+    if len(result["tried"]) > 1:
+        rec["retries"] = len(result["tried"]) - 1
+    headers = {"x-rotate-account": result["account"] or "",
+               "x-rotate-elapsed-s": str(result["elapsed_s"])}
+    if result["ok"]:
+        rec["status"] = 200
+        audit(rec)
+        return JSONResponse(codex_image.to_openai(result), headers=headers)
+    if result["account"] is None:
+        rec["status"] = 503
+        audit(rec)
+        return JSONResponse(
+            {"error": {"message": "claude-rotate: no codex account has image quota left "
+                                  f"({result['error']}); retry in {result['retry_after']}s",
+                       "type": "overloaded_error"}},
+            status_code=503, headers=headers | {"retry-after": str(result["retry_after"])})
+    rec["status"] = 502
+    audit(rec)
+    return JSONResponse({"error": {"message": f"codex: {result['error']}",
+                                   "type": "api_error"}}, status_code=502, headers=headers)
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def proxy(request: Request, path: str):
     device = device_from_request(request)
@@ -728,6 +821,11 @@ async def proxy(request: Request, path: str):
             {"type": "error", "error": {"type": "authentication_error",
                                         "message": "claude-rotate: unknown device key"}},
             status_code=401)
+    if not ACCOUNTS:
+        return JSONResponse(
+            {"type": "error", "error": {"type": "invalid_request_error",
+                                        "message": "claude-rotate: no claude accounts configured"}},
+            status_code=503)
 
     body = await request.body()
     fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP}

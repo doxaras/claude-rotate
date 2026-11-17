@@ -342,6 +342,46 @@ it returns `503` + `Retry-After: <seconds to earliest reset>` — point a
 router's circuit breaker at that. Responses carry `x-rotate-account` and the
 upstream `anthropic-ratelimit-unified-*` headers for per-request telemetry.
 
+## Image generation on ChatGPT plans (Codex)
+
+`POST /v1/images/generations` (same device-key auth) generates one image per
+call on a ChatGPT-plan account through the official Codex CLI and returns it
+OpenAI-style as `b64_json`:
+
+```bash
+npm i -g @openai/codex
+./setup.sh add-codex-account plus-1     # device-code login into codex/plus-1
+curl -s http://my-server:8484/v1/images/generations \
+  -H "Authorization: Bearer $DEVICE_KEY" -H "Content-Type: application/json" \
+  -d '{"prompt": "a data centre at dusk", "size": "1536x1024"}'
+```
+
+- **No token to export.** Plus/Pro plans can't mint Codex access tokens (that
+  is an Enterprise feature), so each account is its own `CODEX_HOME` with a
+  device login that Codex refreshes itself. Turn on "device code sign-in for
+  Codex" in ChatGPT → Settings → Security first. Never copy another machine's
+  `auth.json`: both copies rotate the same refresh token and sign each other out.
+- **How it runs.** One `codex exec` per image with a prompt pinned to a single
+  image-tool call (~40 s; an unpinned agent plans and wanders for ~60 s). The
+  PNG is read from `CODEX_HOME/generated_images/<thread_id>/`.
+- **Exact quota.** Codex session logs record the plan's 5h and weekly windows
+  (`rate_limits.primary/secondary`); they feed the same thresholds and
+  priority/consume-first policy as Claude accounts and show up under
+  `codex_accounts` in `/rotate/status`.
+- **Rotation.** Spent window → next account; lost login → account benched for
+  30 min; refusal/bad prompt → 502 without burning another account; nothing
+  left → `503` + `Retry-After`.
+- **Codex-only instances** are fine: with `codex_accounts` and no Claude
+  `accounts`, the Claude routes answer 503.
+
+```json
+"codex_accounts": [{"name": "plus-1", "codex_home": "codex/plus-1"}],
+"codex": {"bin": "codex", "model": "gpt-6.1-sol", "reasoning_effort": "low",
+          "timeout_s": 300, "concurrency": 2}
+```
+
+The same terms caveat as above applies: these are consumer plans.
+
 ## Configuration (`config.json`)
 
 | Field | Meaning |
