@@ -5,6 +5,9 @@ Devices point at this proxy and authenticate with an internal device key:
     export ANTHROPIC_BASE_URL=http://my-server:8484   # over tailscale
     export CLAUDE_CODE_OAUTH_TOKEN=<device key from config.json>
 
+(or, to keep the device's own claude.ai login, ANTHROPIC_CUSTOM_HEADERS=
+"X-Rotate-Device-Key: <device key>" instead of CLAUDE_CODE_OAUTH_TOKEN).
+
 Per request, the proxy:
   1. maps the device key -> device name (401 if unknown),
   2. swaps in the active account's real setup-token,
@@ -44,9 +47,12 @@ STATE_PATH = ROOT / "state.json"
 AUDIT_PATH = ROOT / "logs" / "audit.jsonl"
 
 UPSTREAM = "https://api.anthropic.com"
+# Alternative to sending the device key as the bearer token; see device_from_request.
+DEVICE_KEY_HEADER = "x-rotate-device-key"
 HOP = {
     "host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "content-length", "accept-encoding",
+    DEVICE_KEY_HEADER,  # the device key never goes upstream
 }
 
 app = FastAPI()
@@ -348,6 +354,13 @@ async def rotate_status(request: Request):
 
 
 def device_from_request(request: Request) -> str | None:
+    # A device that keeps its own claude.ai login (so features that talk to
+    # claude.ai directly - Claude in Chrome, claude.ai connectors, /usage - keep
+    # working) sends its key in DEVICE_KEY_HEADER via ANTHROPIC_CUSTOM_HEADERS;
+    # its Authorization then carries that login's token, which is never forwarded.
+    key = request.headers.get(DEVICE_KEY_HEADER, "")
+    if key:
+        return DEVICE_BY_KEY.get(key)
     auth = request.headers.get("authorization", "")
     key = auth[7:] if auth.lower().startswith("bearer ") else request.headers.get("x-api-key", "")
     if not key:

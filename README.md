@@ -175,6 +175,29 @@ rides account 2. Use a VPN/overlay like Tailscale between devices and server —
 the proxy speaks plain HTTP and device keys are bearer secrets. See
 [Connecting distributed devices](#connecting-distributed-devices) for setups.
 
+### Keeping the device's own login (Claude in Chrome, claude.ai connectors)
+
+With the device key in `CLAUDE_CODE_OAUTH_TOKEN`, Claude Code treats it as an
+inference-only token: features that talk to claude.ai directly rather than to
+the API stop working. Claude in Chrome does not connect at all (its debug log
+says `token accepted by the Chrome extension=false`; its bridge authenticates
+with the login's own token), and claude.ai connectors and `/usage` fail too.
+
+A device that is logged in (`/login`) can keep that login and send its key in a
+header instead:
+
+```bash
+export ANTHROPIC_BASE_URL=http://<server>:8484
+export ANTHROPIC_CUSTOM_HEADERS="X-Rotate-Device-Key: <device key>"
+# and no CLAUDE_CODE_OAUTH_TOKEN
+```
+
+The proxy identifies the device by `X-Rotate-Device-Key` whenever it is
+present, replaces the `Authorization` header (the device's own token) with the
+active account's token as usual, and never forwards either upstream. Only API
+requests go through the proxy; everything else keeps using the device's own
+account, so `/usage` shows that account, not the one serving the requests.
+
 ## Connecting distributed devices
 
 The proxy is plain HTTP and device keys are bearer secrets, so the transport
@@ -387,7 +410,7 @@ The same terms caveat as above applies: these are consumer plans.
 | Field | Meaning |
 |---|---|
 | `accounts[]` | `{name, token_file}` — one `claude setup-token` per subscription, stored under `tokens/` (chmod 600) |
-| `devices{}` | `name → device key`; key is what the device puts in `CLAUDE_CODE_OAUTH_TOKEN` |
+| `devices{}` | `name → device key`; key is what the device puts in `CLAUDE_CODE_OAUTH_TOKEN` (or in an `X-Rotate-Device-Key` header, see [Keeping the device's own login](#keeping-the-devices-own-login-claude-in-chrome-claudeai-connectors)) |
 | `accounts[].priority` | lower = preferred; accounts form tiers, backup tiers only used when every preferred account is spent (default 100) |
 | `accounts[].disabled` | `true` benches an account: never rotated onto, still shown in the panel |
 | `switch_threshold` | 5h-window utilization that triggers rotation (default 0.8) |

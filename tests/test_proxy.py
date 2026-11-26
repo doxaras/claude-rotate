@@ -118,6 +118,27 @@ check("audit written with usage + device + account",
       recs and recs[-1]["device"] == "laptop" and recs[-1]["account"] == "a"
       and recs[-1]["usage"]["input_tokens"] == 7 and recs[-1]["model"] == "claude-opus-5")
 
+# --- 2b. device key in x-rotate-device-key, the client's own login as bearer --
+fresh_state()
+seen.clear()
+
+
+def header_handler(req):
+    seen["auth"] = req.headers.get("authorization")
+    seen["device-header"] = req.headers.get("x-rotate-device-key")
+    return httpx.Response(200, json={"usage": {"input_tokens": 1, "output_tokens": 1}},
+                          headers=unified())
+
+
+use_upstream(header_handler)
+r = call(key="sk-ant-oat01-the-clients-own-login", headers={"x-rotate-device-key": "devkey-1"})
+check("device key header authenticates despite a foreign bearer", r.status_code == 200)
+check("client's own login swapped for account token", seen["auth"] == "Bearer tok-a")
+check("device key header not forwarded upstream", seen["device-header"] is None)
+check("audit names the header's device", audit_recs()[-1]["device"] == "laptop")
+check("unknown device key header → 401 even with a known bearer",
+      call(headers={"x-rotate-device-key": "wrong-key"}).status_code == 401)
+
 # --- 3. SSE relay ------------------------------------------------------------
 fresh_state()
 SSE = ('event: message_start\n'
