@@ -49,6 +49,7 @@ AUDIT_PATH = ROOT / "logs" / "audit.jsonl"
 UPSTREAM = "https://api.anthropic.com"
 # Alternative to sending the device key as the bearer token; see device_from_request.
 DEVICE_KEY_HEADER = "x-rotate-device-key"
+SESSION_HEADER = "x-claude-code-session-id"  # logged as the audit record's session_id
 HOP = {
     "host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "content-length", "accept-encoding",
@@ -860,6 +861,11 @@ async def proxy(request: Request, path: str):
            "model": model, "status": upstream.status_code}
     if retries:
         rec["retries"] = retries
+    # Claude Code names its session in every request; with it an audit record
+    # can be matched to the transcript entry it produced.
+    session_id = request.headers.get(SESSION_HEADER)
+    if session_id:
+        rec["session_id"] = session_id
     resp_headers = {k: v for k, v in upstream.headers.items()
                     if k.lower() not in HOP and k.lower() != "content-encoding"}
     resp_headers["x-rotate-account"] = account

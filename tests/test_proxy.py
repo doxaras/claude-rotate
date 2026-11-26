@@ -104,7 +104,8 @@ def ok_handler(req):
 
 
 use_upstream(ok_handler)
-r = call(headers={"x-api-key": "should-be-dropped", "anthropic-beta": "oauth-2025-04-20"})
+r = call(headers={"x-api-key": "should-be-dropped", "anthropic-beta": "oauth-2025-04-20",
+                  "x-claude-code-session-id": "session-1"})
 check("success passes through", r.status_code == 200)
 check("device key swapped for account token", seen["auth"] == "Bearer tok-a")
 check("accept-encoding forced to identity", seen["accept-encoding"] == "identity")
@@ -117,6 +118,7 @@ recs = audit_recs()
 check("audit written with usage + device + account",
       recs and recs[-1]["device"] == "laptop" and recs[-1]["account"] == "a"
       and recs[-1]["usage"]["input_tokens"] == 7 and recs[-1]["model"] == "claude-opus-5")
+check("audit records Claude Code's session id", recs[-1].get("session_id") == "session-1")
 
 # --- 2b. device key in x-rotate-device-key, the client's own login as bearer --
 fresh_state()
