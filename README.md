@@ -348,7 +348,11 @@ JSON endpoints: `/rotate/status` (accounts + switch events) and
 auth. Audit trail: `logs/audit.jsonl`, one JSON record per request; a request
 from Claude Code also records its `X-Claude-Code-Session-Id` as `session_id`, so
 a record can be matched to the transcript (`~/.claude/projects/.../<session
-id>.jsonl`) it belongs to.
+id>.jsonl`) it belongs to. Each record of a proxied request carries the
+account's quota as the reply reported it - `util_5h`, `util_7d`, `reset_5h`,
+`reset_7d` and `ratelimit_status`, copied from the `anthropic-ratelimit-unified-*`
+headers - so the log is a per-request time series of every account's 5-hour and
+weekly windows.
 
 ## OpenAI-compatible endpoint
 

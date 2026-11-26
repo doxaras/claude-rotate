@@ -321,6 +321,27 @@ def summarize_usage(usage: dict | None) -> dict | None:
         "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")}
 
 
+# Audit-record key -> the unified rate-limit header it copies (as the header's
+# string, the way util_5h always was). With both windows' utilization and
+# resets in every record, the audit log alone is a per-request time series of
+# each account's quota - e.g. to see between which two requests the weekly
+# percent stepped, and what those requests cost.
+AUDIT_RATE_LIMIT_HEADERS = {
+    "util_5h": "anthropic-ratelimit-unified-5h-utilization",
+    "util_7d": "anthropic-ratelimit-unified-7d-utilization",
+    "reset_5h": "anthropic-ratelimit-unified-5h-reset",
+    "reset_7d": "anthropic-ratelimit-unified-7d-reset",
+    "ratelimit_status": "anthropic-ratelimit-unified-status",
+}
+
+
+def rate_limit_fields(headers: httpx.Headers) -> dict:
+    """The audit record's rate-limit fields: util_5h always (None without the
+    header, as before), the others only when the response carried them."""
+    fields = {key: headers.get(header) for key, header in AUDIT_RATE_LIMIT_HEADERS.items()}
+    return {key: value for key, value in fields.items() if value is not None or key == "util_5h"}
+
+
 @app.get("/rotate/status")
 async def rotate_status(request: Request):
     if device_from_request(request) is None:
@@ -734,8 +755,7 @@ async def openai_chat(request: Request):
             finally:
                 await upstream.aclose()
                 rec["usage"] = summarize_usage(tr.usage)
-                rec["util_5h"] = upstream.headers.get(
-                    "anthropic-ratelimit-unified-5h-utilization")
+                rec.update(rate_limit_fields(upstream.headers))
                 audit(rec)
                 await note_response(account, upstream.headers, upstream.status_code)
 
@@ -746,7 +766,7 @@ async def openai_chat(request: Request):
     await upstream.aclose()
     if not noted:
         await note_response(account, upstream.headers, upstream.status_code)
-    rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
+    rec.update(rate_limit_fields(upstream.headers))
     if upstream.status_code != 200:
         try:
             msg = json.loads(content).get("error", {}).get("message") \
@@ -881,7 +901,7 @@ async def proxy(request: Request, path: str):
             finally:
                 await upstream.aclose()
                 rec["usage"] = summarize_usage(usage_acc)
-                rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
+                rec.update(rate_limit_fields(upstream.headers))
                 audit(rec)
                 await note_response(account, upstream.headers, upstream.status_code)
 
@@ -895,7 +915,7 @@ async def proxy(request: Request, path: str):
         rec["usage"] = summarize_usage(json.loads(content).get("usage"))
     except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
         pass
-    rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
+    rec.update(rate_limit_fields(upstream.headers))
     if rec["path"].startswith("/v1/messages") or rec.get("usage"):
         audit(rec)
     if not noted:
