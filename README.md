@@ -322,7 +322,11 @@ rate-limit headers:
 
 JSON endpoints: `/rotate/status` (accounts + switch events) and
 `/rotate/stats` (rollups + alerts), same `?key=` or `Authorization: Bearer`
-auth. Audit trail: `logs/audit.jsonl`, one JSON record per request.
+auth. Audit trail: `logs/audit.jsonl`, one JSON record per request. Each
+record of a proxied request carries the account's quota as the reply reported
+it - `util_5h`, `util_7d`, `reset_5h`, `reset_7d` and `ratelimit_status`,
+copied from the `anthropic-ratelimit-unified-*` headers - so the log is a
+per-request time series of every account's 5-hour and weekly windows.
 
 ## OpenAI-compatible endpoint
 

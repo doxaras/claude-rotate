@@ -117,6 +117,10 @@ recs = audit_recs()
 check("audit written with usage + device + account",
       recs and recs[-1]["device"] == "laptop" and recs[-1]["account"] == "a"
       and recs[-1]["usage"]["input_tokens"] == 7 and recs[-1]["model"] == "claude-opus-5")
+check("audit records both windows' utilization, resets and status",
+      recs[-1]["util_5h"] == "0.5" and recs[-1]["util_7d"] == "0.2"
+      and float(recs[-1]["reset_5h"]) > time.time() and float(recs[-1]["reset_7d"]) > time.time()
+      and recs[-1]["ratelimit_status"] == "allowed")
 
 # --- 3. SSE relay ------------------------------------------------------------
 fresh_state()
@@ -134,6 +138,7 @@ check("SSE usage captured to audit",
       recs and recs[-1]["usage"] == {"input_tokens": 11, "output_tokens": 33,
                                      "cache_read_input_tokens": 0,
                                      "cache_creation_input_tokens": 0})
+check("SSE audit records the 7d utilization too", recs[-1]["util_7d"] == "0.2")
 
 # --- 4. quota 429 → rotate → transparent retry -------------------------------
 fresh_state("a", {"b": {"util_5h": 0.1, "util_7d": 0.1}})
