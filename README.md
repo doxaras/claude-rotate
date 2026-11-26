@@ -322,7 +322,10 @@ rate-limit headers:
 
 JSON endpoints: `/rotate/status` (accounts + switch events) and
 `/rotate/stats` (rollups + alerts), same `?key=` or `Authorization: Bearer`
-auth. Audit trail: `logs/audit.jsonl`, one JSON record per request.
+auth. Audit trail: `logs/audit.jsonl`, one JSON record per request; a request
+from Claude Code also records its `X-Claude-Code-Session-Id` as `session_id`, so
+a record can be matched to the transcript (`~/.claude/projects/.../<session
+id>.jsonl`) it belongs to.
 
 ## OpenAI-compatible endpoint
 
