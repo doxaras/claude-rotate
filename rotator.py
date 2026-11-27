@@ -19,7 +19,8 @@ Per request, the proxy:
   7. optionally holds a request open until the soonest window reset when every
      account is spent (hold_max_s), so unattended runs finish on their own.
 
-GET /rotate/status (device-key auth) returns live state for the admin page.
+GET /rotate/status (device-key auth) returns live state for the admin page;
+GET /rotate/panel serves that page, whose HTML, CSS and JS live in panel/.
 """
 
 import asyncio
@@ -33,7 +34,7 @@ from pathlib import Path
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 import codex_image
 from oai_compat import SseToOai, anthropic_to_oai, oai_to_anthropic
@@ -529,72 +530,12 @@ async def rotate_stats(request: Request):
     return aggregate_audit()
 
 
-PANEL_HTML = """<!doctype html><html><head><meta charset="utf-8">
-<title>claude-rotate</title>
-<style>
- body{font-family:-apple-system,sans-serif;margin:2rem;background:#12151a;color:#e6e6e6}
- h1{font-size:1.3rem} h2{font-size:1rem;margin-top:1.6rem;color:#9ecbff}
- table{border-collapse:collapse;margin-top:.4rem;min-width:520px}
- td,th{padding:.3rem .8rem;border-bottom:1px solid #2a2f38;text-align:right;font-variant-numeric:tabular-nums}
- td:first-child,th:first-child{text-align:left}
- .gauge{display:inline-block;width:220px;height:12px;background:#2a2f38;border-radius:6px;overflow:hidden;vertical-align:middle;margin:0 .6rem}
- .gauge i{display:block;height:100%;background:#4caf7d} .gauge i.hot{background:#e0664d}
- .active{color:#7dd87d;font-weight:600} .alert-warn{color:#ffb454} .alert-info{color:#9ecbff}
- .muted{color:#8a919c;font-size:.85rem}
-</style></head><body>
-<h1>claude-rotate <span class="muted" id="upd"></span></h1>
-<h2>Devices</h2><table id="t-roster"></table>
-<div id="accounts"></div>
-<h2>Alerts</h2><div id="alerts" class="muted">none</div>
-<h2>Consumption by device (24h)</h2><table id="t-device"></table>
-<h2>Consumption by model (24h)</h2><table id="t-model"></table>
-<h2>Consumption by account (24h)</h2><table id="t-account"></table>
-<h2>Recent switches</h2><div id="events" class="muted">none</div>
-<p class="muted">Cost = API-equivalent dollars at list prices (incl. cache read 0.1x / write 1.25x) — actual spend is covered by the Max subscriptions.</p>
-<script>
-const KEY = new URLSearchParams(location.search).get('key');
-function fmt(n){return n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':''+n}
-function table(el, data){
-  let h='<tr><th></th><th>req</th><th>in</th><th>out</th><th>cache r</th><th>cache w</th><th>$ equiv</th></tr>';
-  for(const [k,v] of Object.entries(data))
-    h+=`<tr><td>${k}</td><td>${v.requests}</td><td>${fmt(v.input_tokens)}</td><td>${fmt(v.output_tokens)}</td><td>${fmt(v.cache_read)}</td><td>${fmt(v.cache_write)}</td><td>$${v.cost_usd.toFixed(2)}</td></tr>`;
-  el.innerHTML=h;
-}
-async function refresh(){
-  const [st, stats] = await Promise.all([
-    fetch('/rotate/status?key='+KEY).then(r=>r.json()),
-    fetch('/rotate/stats?key='+KEY).then(r=>r.json())]);
-  let rh='<tr><th>device</th><th>status</th><th>last seen</th><th>last model</th><th>via account</th><th>req 1h</th><th>tokens 1h</th><th>key</th></tr>';
-  for(const [name,d] of Object.entries(stats.devices||{})){
-    const status = d.online ? '<span class="active">● online</span>' : '<span class="muted">○ idle</span>';
-    const seen = d.last_seen_min==null ? 'never' : d.last_seen_min<1 ? 'just now'
-      : d.last_seen_min<60 ? d.last_seen_min+' min ago' : (d.last_seen_min/60).toFixed(1)+' h ago';
-    rh+=`<tr><td>${name}</td><td>${status}</td><td>${seen}</td><td>${d.last_model||'—'}</td><td>${d.last_account||'—'}</td><td>${d.req_1h}</td><td>${fmt(d.tokens_1h)}</td><td class="muted">${d.key_suffix}</td></tr>`;
-  }
-  document.getElementById('t-roster').innerHTML=rh;
-  let h='';
-  for(const [name,a] of Object.entries(st.accounts)){
-    const u=a.effective_util_5h||0, w=a.util_7d||0;
-    const act=name===st.active_account?' <span class="active">● active</span>':'';
-    const tags=(a.disabled?' <span class="alert-warn">(disabled)</span>':'')
-      +(a.priority!==100?` <span class="muted">prio ${a.priority}</span>`:'');
-    h+=`<p><b>${name}</b>${tags}${act}<br>5h <span class="gauge"><i class="${u>=st.switch_threshold?'hot':''}" style="width:${Math.min(100,u*100)}%"></i></span>${(u*100).toFixed(0)}%`
-      +(a.reset_5h_in_min!=null?` <span class="muted">resets in ${a.reset_5h_in_min} min</span>`:'')
-      +`<br>7d <span class="gauge"><i style="width:${Math.min(100,w*100)}%"></i></span>${(w*100).toFixed(0)}%`
-      +(a.reset_7d_in_h!=null?` <span class="muted">resets in ${a.reset_7d_in_h} h</span>`:'')+`</p>`;
-  }
-  document.getElementById('accounts').innerHTML=h;
-  document.getElementById('alerts').innerHTML = stats.alerts.length
-    ? stats.alerts.map(a=>`<div class="alert-${a.level}">⚠ ${a.text}</div>`).join('') : 'none';
-  table(document.getElementById('t-device'), stats.by_device);
-  table(document.getElementById('t-model'), stats.by_model);
-  table(document.getElementById('t-account'), stats.by_account);
-  document.getElementById('events').innerHTML = st.recent_events.length
-    ? st.recent_events.map(e=>`<div>${e.ts} — ${e.from} → ${e.to} (${e.reason})</div>`).join('') : 'none';
-  document.getElementById('upd').textContent='updated '+new Date().toLocaleTimeString();
-}
-refresh(); setInterval(refresh, 10000);
-</script></body></html>"""
+# The panel's page, style and script live in panel/ and are read per request,
+# so editing them needs no restart. Only the page asks for a device key: the
+# stylesheet and script hold no data — they fetch it from /rotate/status and
+# /rotate/stats with the page's ?key=.
+PANEL_DIR = ROOT / "panel"
+PANEL_ASSETS = {"panel.css": "text/css", "panel.js": "text/javascript"}
 
 
 @app.get("/rotate/panel")
@@ -602,7 +543,14 @@ async def rotate_panel(request: Request):
     if device_from_request(request) is None:
         return JSONResponse({"error": "unknown device key — open /rotate/panel?key=<device key>"},
                             status_code=401)
-    return Response(content=PANEL_HTML, media_type="text/html")
+    return FileResponse(PANEL_DIR / "panel.html", media_type="text/html")
+
+
+@app.get("/rotate/panel/{asset}")
+async def rotate_panel_asset(asset: str):
+    if asset not in PANEL_ASSETS:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(PANEL_DIR / asset, media_type=PANEL_ASSETS[asset])
 
 
 async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
