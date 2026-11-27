@@ -537,8 +537,10 @@ PANEL_HTML = """<!doctype html><html><head><meta charset="utf-8">
  table{border-collapse:collapse;margin-top:.4rem;min-width:520px}
  td,th{padding:.3rem .8rem;border-bottom:1px solid #2a2f38;text-align:right;font-variant-numeric:tabular-nums}
  td:first-child,th:first-child{text-align:left}
- .gauge{display:inline-block;width:220px;height:12px;background:#2a2f38;border-radius:6px;overflow:hidden;vertical-align:middle;margin:0 .6rem}
+ .gauge{position:relative;display:inline-block;width:220px;height:12px;background:#2a2f38;border-radius:6px;overflow:hidden;vertical-align:middle;margin:0 .6rem}
  .gauge i{display:block;height:100%;background:#4caf7d} .gauge i.hot{background:#e0664d}
+ .gauge em,.pace{display:inline-block;width:2px;background:#fff} .gauge em{position:absolute;top:0;bottom:0;margin-left:-1px}
+ .pace{height:12px;vertical-align:middle;margin-right:.3rem}
  .active{color:#7dd87d;font-weight:600} .alert-warn{color:#ffb454} .alert-info{color:#9ecbff}
  .muted{color:#8a919c;font-size:.85rem}
 </style></head><body>
@@ -560,6 +562,15 @@ function table(el, data){
     h+=`<tr><td>${k}</td><td>${v.requests}</td><td>${fmt(v.input_tokens)}</td><td>${fmt(v.output_tokens)}</td><td>${fmt(v.cache_read)}</td><td>${fmt(v.cache_write)}</td><td>$${v.cost_usd.toFixed(2)}</td></tr>`;
   el.innerHTML=h;
 }
+// A usage gauge; its white mark is the share of the window already elapsed,
+// i.e. where usage at a constant rate from the window's start to its reset
+// would stand now. No mark when the reset is unknown or already past.
+function gauge(used, reset, period_s, hot){
+  const left=reset-Date.now()/1000;
+  const pace=reset&&left>0?Math.min(100,Math.max(0,(1-left/period_s)*100)):null;
+  return `<span class="gauge"><i class="${hot?'hot':''}" style="width:${Math.min(100,used*100)}%"></i>`
+    +(pace!=null?`<em style="left:${pace}%" title="constant-rate pace: ${pace.toFixed(0)}% of the window elapsed"></em>`:'')+'</span>';
+}
 async function refresh(){
   const [st, stats] = await Promise.all([
     fetch('/rotate/status?key='+KEY).then(r=>r.json()),
@@ -574,15 +585,16 @@ async function refresh(){
   document.getElementById('t-roster').innerHTML=rh;
   let h='';
   for(const [name,a] of Object.entries(st.accounts)){
-    const u=a.effective_util_5h||0, w=a.util_7d||0;
+    const u=a.effective_util_5h||0, w=a.effective_util_7d||0;
     const act=name===st.active_account?' <span class="active">● active</span>':'';
     const tags=(a.disabled?' <span class="alert-warn">(disabled)</span>':'')
       +(a.priority!==100?` <span class="muted">prio ${a.priority}</span>`:'');
-    h+=`<p><b>${name}</b>${tags}${act}<br>5h <span class="gauge"><i class="${u>=st.switch_threshold?'hot':''}" style="width:${Math.min(100,u*100)}%"></i></span>${(u*100).toFixed(0)}%`
+    h+=`<p><b>${name}</b>${tags}${act}<br>5h ${gauge(u,a.reset_5h,5*3600,u>=st.switch_threshold)}${(u*100).toFixed(0)}%`
       +(a.reset_5h_in_min!=null?` <span class="muted">resets in ${a.reset_5h_in_min} min</span>`:'')
-      +`<br>7d <span class="gauge"><i style="width:${Math.min(100,w*100)}%"></i></span>${(w*100).toFixed(0)}%`
+      +`<br>7d ${gauge(w,a.reset_7d,7*86400,false)}${(w*100).toFixed(0)}%`
       +(a.reset_7d_in_h!=null?` <span class="muted">resets in ${a.reset_7d_in_h} h</span>`:'')+`</p>`;
   }
+  if(h) h+='<p class="muted"><span class="pace"></span>= the elapsed share of the window: a bar past it is using the limit faster than the window runs out</p>';
   document.getElementById('accounts').innerHTML=h;
   document.getElementById('alerts').innerHTML = stats.alerts.length
     ? stats.alerts.map(a=>`<div class="alert-${a.level}">⚠ ${a.text}</div>`).join('') : 'none';
