@@ -1,11 +1,77 @@
-body{font-family:-apple-system,sans-serif;margin:2rem;background:#12151a;color:#e6e6e6}
-h1{font-size:1.3rem} h2{font-size:1rem;margin-top:1.6rem;color:#9ecbff}
-table{border-collapse:collapse;margin-top:.4rem;min-width:520px}
-td,th{padding:.3rem .8rem;border-bottom:1px solid #2a2f38;text-align:right;font-variant-numeric:tabular-nums}
-td:first-child,th:first-child{text-align:left}
-.gauge{position:relative;display:inline-block;width:220px;height:12px;background:#2a2f38;border-radius:6px;overflow:hidden;vertical-align:middle;margin:0 .6rem}
-.gauge i{display:block;height:100%;background:#4caf7d} .gauge i.hot{background:#e0664d}
-.gauge em,.pace{display:inline-block;width:2px;background:#fff} .gauge em{position:absolute;top:0;bottom:0;margin-left:-1px}
-.pace{height:12px;vertical-align:middle;margin-right:.3rem}
-.active{color:#7dd87d;font-weight:600} .alert-warn{color:#ffb454} .alert-info{color:#9ecbff}
-.muted{color:#8a919c;font-size:.85rem}
+body {
+	font-family: -apple-system, sans-serif;
+	margin: 2rem;
+	background: #12151a;
+	color: #e6e6e6
+}
+h1 {
+	font-size: 1.3rem
+}
+h2 {
+	font-size: 1rem;
+	margin-top: 1.6rem;
+	color: #9ecbff
+}
+table {
+	border-collapse: collapse;
+	margin-top: .4rem;
+	min-width: 520px
+}
+td, th {
+	padding: .3rem .8rem;
+	border-bottom: 1px solid #2a2f38;
+	text-align: right;
+	font-variant-numeric: tabular-nums
+}
+td:first-child, th:first-child {
+	text-align: left
+}
+.gauge {
+	position: relative;
+	display: inline-block;
+	width: 220px;
+	height: 12px;
+	background: #2a2f38;
+	border-radius: 6px;
+	overflow: hidden;
+	vertical-align: middle;
+	margin: 0 .6rem
+}
+.gauge i {
+	display: block;
+	height: 100%;
+	background: #4caf7d
+}
+.gauge i.hot {
+	background: #e0664d
+}
+.gauge em, .pace {
+	display: inline-block;
+	width: 2px;
+	background: #fff
+}
+.gauge em {
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	margin-left: -1px
+}
+.pace {
+	height: 12px;
+	vertical-align: middle;
+	margin-right: .3rem
+}
+.active {
+	color: #7dd87d;
+	font-weight: 600
+}
+.alert-warn {
+	color: #ffb454
+}
+.alert-info {
+	color: #9ecbff
+}
+.muted {
+	color: #8a919c;
+	font-size: .85rem
+}
