@@ -32,7 +32,11 @@ def fresh_state(active="a"):
     R.STATE = R.State(active_account=active)
 
 
-R.ACCOUNTS = {"a": {"name": "a"}, "b": {"name": "b"}, "c": {"name": "c"}}
+def acct(name, **options):
+    return R.Account_config(name=name, token="", **options)
+
+
+R.ACCOUNTS = {n: acct(n) for n in "abc"}
 R.THRESHOLD, R.THRESHOLD_7D = 0.8, 0.98
 R.STRATEGY, R.COOLDOWN_S, R.SWITCH_MARGIN, R.CF_MARGIN_S = "consume-first", 300, 0.05, 3600
 run = asyncio.run
@@ -154,8 +158,7 @@ v = run(R.note_response("b", headers(u5=0.5, u7=0.6), 200))
 check("no consume-first onto a passed weekly reset", v is None and R.STATE.active_account == "b")
 
 # 9. priority tiers: preferred tier always beats a sooner weekly reset
-R.ACCOUNTS = {"a": {"name": "a", "priority": 2},
-              "b": {"name": "b", "priority": 1}, "c": {"name": "c", "priority": 1}}
+R.ACCOUNTS = {"a": acct("a", priority=2), "b": acct("b", priority=1), "c": acct("c", priority=1)}
 fresh_state()
 R.STATE.accounts = {
     "a": R.Account(util_5h=0.1, util_7d=0.1, reset_7d=now + 1000),    # soonest, but backup tier
@@ -188,7 +191,7 @@ v = run(R.note_response("a", headers(u5=0.2), 200))
 check("priority recovery respects cooldown", v is None and R.STATE.active_account == "a")
 
 # 11. disabled accounts: never picked, active one abandoned immediately
-R.ACCOUNTS = {"a": {"name": "a", "disabled": True}, "b": {"name": "b"}, "c": {"name": "c"}}
+R.ACCOUNTS = {"a": acct("a", disabled=True), "b": acct("b"), "c": acct("c")}
 fresh_state("a")
 R.STATE.accounts = {"a": R.Account(util_5h=0.0), "b": R.Account(util_5h=0.2), "c": R.Account(util_5h=0.1)}
 check("disabled excluded from pick", R.pick_account() == "c")
@@ -205,7 +208,7 @@ R.STATE.accounts = {"a": R.Account(util_5h=1.0, reset_5h=now + 10),
 check("fallback skips disabled", R.pick_account() == "c")
 
 # 12. all-spent fallback ignores a stale 5h reset on a week-exhausted account (issue #3)
-R.ACCOUNTS = {"a": {"name": "a"}, "b": {"name": "b"}}
+R.ACCOUNTS = {n: acct(n) for n in "ab"}
 fresh_state("b")
 R.STATE.accounts = {
     "a": R.Account(util_5h=0.03, reset_5h=now - 72000,    # 5h window reset long ago...
@@ -230,7 +233,7 @@ check("relief is the later blocking reset", abs(R.relief_ts("a", now) - (now + 9
 check("fallback picks soonest relief over soonest 5h reset", R.pick_account() == "b")
 check("earliest_relief ignores a 5h reset that won't free the account",
       abs(R.earliest_relief() - (now + 5000)) < 5)
-R.ACCOUNTS["b"]["disabled"] = True
+R.ACCOUNTS["b"].disabled = True
 check("earliest_relief skips disabled accounts", abs(R.earliest_relief() - (now + 9000)) < 5)
 R.STATE.accounts["a"].reset_7d = None
 check("earliest_relief falls back to 5 min with no known relief",

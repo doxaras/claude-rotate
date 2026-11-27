@@ -82,7 +82,7 @@ def test_add_account_and_device():
         assert data["accounts"] == {"acct-1": "sk-ant-oat01-one"}
         assert data["devices"]["laptop"].startswith("dev-laptop-") and data["devices"]["laptop"] in out
         cfg = R.load_config()
-        assert [a["name"] for a in cfg["accounts"]] == ["acct-1"]
+        assert [a.name for a in cfg.accounts] == ["acct-1"]
 
 
 def test_add_device_drops_a_placeholder():
@@ -126,8 +126,8 @@ def test_migrate_splits_an_old_config():
         assert settings == {"bind": "10.0.0.5", "switch_threshold": 0.9, "alerts": {"util_warn": 0.7},
                             "account_options": {"a": {"priority": 1}, "plus-1": {"disabled": True}}}
         cfg = R.load_config()
-        assert cfg["accounts"] == [{"priority": 1, "name": "a", "token": "sk-ant-oat01-a"}]
-        assert cfg["codex_accounts"][0]["disabled"] is True
+        assert cfg.accounts == [R.Account_config(name="a", token="sk-ant-oat01-a", priority=1)]
+        assert cfg.codex_accounts[0].disabled is True
         status, out = run("migrate")
         assert status == 0 and "nothing to migrate" in out, out
 

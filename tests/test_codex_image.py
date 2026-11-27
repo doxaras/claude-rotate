@@ -58,7 +58,7 @@ def _accounts(tmp: Path, *names: str) -> dict:
     out = {}
     for n in names:
         (tmp / n).mkdir()
-        out[n] = {"name": n, "codex_home": str(tmp / n)}
+        out[n] = ci.Codex_account_config(name=n, codex_home=str(tmp / n))
     return out
 
 
@@ -90,7 +90,9 @@ def test_classify_failure():
 
 def test_pick_priority_then_consume_first():
     now = time.time()
-    accts = {"a": {}, "b": {}, "c": {"priority": 1}, "d": {"disabled": True}}
+    accts = {n: ci.Codex_account_config(name=n, codex_home="") for n in "abcd"}
+    accts["c"].priority = 1
+    accts["d"].disabled = True
     state = {"a": ci.Codex_account(reset_7d=now + 900_000),
              "b": ci.Codex_account(reset_7d=now + 100_000),
              "c": ci.Codex_account(util_5h=0.95, reset_5h=now + 60)}
@@ -119,8 +121,8 @@ def test_generate_success_records_telemetry():
 def test_generate_rotates_on_quota_and_auth():
     with tempfile.TemporaryDirectory() as d:
         accts = _accounts(Path(d), "a", "b", "c")
-        accts["a"]["priority"] = 1
-        accts["b"]["priority"] = 2
+        accts["a"].priority = 1
+        accts["b"].priority = 2
         runner, calls = _fake_runner({"a": "quota", "b": "auth", "c": "ok"})
         state: dict = {}
         res = asyncio.run(ci.generate("hero", None, accounts=accts,

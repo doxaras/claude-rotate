@@ -32,9 +32,9 @@ def check(name, cond):
 tmp = Path(tempfile.mkdtemp())
 R.AUDIT_PATH = tmp / "audit.jsonl"
 R.save_state = lambda: None
-R.ACCOUNTS = {"a": {"name": "a", "token": "tok-a"}, "b": {"name": "b", "token": "tok-b"}}
+R.ACCOUNTS = {"a": R.Account_config(name="a", token="tok-a"), "b": R.Account_config(name="b", token="tok-b")}
 R.DEVICE_BY_KEY = {"devkey-1": "laptop"}
-R.CFG["devices"] = {"laptop": "devkey-1"}
+R.CFG.devices = {"laptop": "devkey-1"}
 R.THRESHOLD, R.THRESHOLD_7D = 0.8, 0.98
 R.STRATEGY, R.COOLDOWN_S, R.SWITCH_MARGIN, R.CF_MARGIN_S = "consume-first", 300, 0.05, 3600
 R.HOLD_MAX_S = 0

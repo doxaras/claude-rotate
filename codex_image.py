@@ -33,6 +33,16 @@ AUTH_BACKOFF_S = 1800  # a signed-out account sits out this long before a retry
 
 
 @dataclass(slots=True)
+class Codex_account_config:
+    """A Codex account: its CODEX_HOME (from confidential.json) and its
+    account_options (from config.json5)."""
+    name: str
+    codex_home: str
+    priority: int = 100  # lower = preferred tier
+    disabled: bool = False
+
+
+@dataclass(slots=True)
 class Codex_account:
     """What is known about one Codex account's quota (from its session logs) and
     login; the proxy persists these in state.json under "codex". A fresh account
@@ -125,9 +135,10 @@ def read_session(codex_home: Path, thread_id: str) -> str:
     return hits[0].read_text(errors="replace") if hits else ""
 
 
-def usable(name: str, accounts: dict, state: dict[str, Codex_account], threshold: float,
+def usable(name: str, accounts: dict[str, Codex_account_config],
+           state: dict[str, Codex_account], threshold: float,
            threshold_7d: float, now: float) -> bool:
-    if accounts[name].get("disabled"):
+    if accounts[name].disabled:
         return False
     info = state.get(name, Codex_account())
     if info.benched_until > now:
@@ -137,7 +148,8 @@ def usable(name: str, accounts: dict, state: dict[str, Codex_account], threshold
     return u5 < threshold and u7 < threshold_7d
 
 
-def pick_codex_account(accounts: dict, state: dict[str, Codex_account], threshold: float,
+def pick_codex_account(accounts: dict[str, Codex_account_config],
+                       state: dict[str, Codex_account], threshold: float,
                        threshold_7d: float, now: float,
                        exclude: set[str] = frozenset()) -> str | None:
     """Same policy as the Claude side: priority tier first, then consume-first
@@ -146,7 +158,7 @@ def pick_codex_account(accounts: dict, state: dict[str, Codex_account], threshol
              and usable(n, accounts, state, threshold, threshold_7d, now)]
     if not under:
         return None
-    return min(under, key=lambda n: (accounts[n].get("priority", 100),
+    return min(under, key=lambda n: (accounts[n].priority,
                                      state.get(n, Codex_account()).reset_7d or float("inf"),
                                      state.get(n, Codex_account()).util_5h))
 
@@ -170,7 +182,8 @@ async def run_codex(codex_bin: str, codex_home: Path, model: str, effort: str,
     return proc.returncode or 0, out.decode(errors="replace")
 
 
-async def generate(prompt: str, size: str | None, *, accounts: dict,
+async def generate(prompt: str, size: str | None, *,
+                   accounts: dict[str, Codex_account_config],
                    state: dict[str, Codex_account],
                    codex_bin: str = "codex", model: str = "gpt-6.1-sol",
                    effort: str = "low", timeout_s: float = 300,
@@ -190,7 +203,7 @@ async def generate(prompt: str, size: str | None, *, accounts: dict,
         if name is None:
             break
         tried.append(name)
-        home = Path(accounts[name]["codex_home"]).expanduser()
+        home = Path(accounts[name].codex_home).expanduser()
         rc, output = await runner(codex_bin, home, model, effort,
                                   build_prompt(prompt, size), timeout_s)
         info = state.setdefault(name, Codex_account())
