@@ -94,6 +94,17 @@ def test_add_device_drops_a_placeholder():
         assert list(confidential(tmp)["devices"]) == ["real"]
 
 
+def test_a_rewrite_keeps_unknown_keys_and_fills_null_sections():
+    with scratch() as tmp:
+        run()
+        (tmp / "confidential.json").write_text(json.dumps(
+            {"accounts": {}, "devices": None, "newer": {"x": 1}}))
+        run("add-device", "real")
+        assert confidential(tmp) == {"accounts": {}, "codex_accounts": {},
+                                     "devices": {"real": confidential(tmp)["devices"]["real"]},
+                                     "newer": {"x": 1}}
+
+
 def test_onboard_refuses_an_existing_name():
     with scratch():
         assert run("onboard", "maria", "laptop")[0] == 0
