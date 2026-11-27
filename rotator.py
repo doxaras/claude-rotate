@@ -201,8 +201,22 @@ def usable(name: str) -> bool:
             and utilization(name) < THRESHOLD and util_7d(name) < THRESHOLD_7D)
 
 
+WEEK_S = 7 * 24 * 3600
+
+
 def weekly_reset(name: str) -> float:
-    return STATE["accounts"].get(name, {}).get("reset_7d") or float("inf")
+    """The account's next weekly reset. A stored reset that has already passed
+    is rolled forward by whole weeks: the new window's reset is only learned
+    from the account's next reply, and until then the stale value would look
+    like the soonest reset of all and draw a consume-first switch onto an
+    account whose week has just started."""
+    reset = STATE["accounts"].get(name, {}).get("reset_7d")
+    if not reset:
+        return float("inf")
+    now = time.time()
+    if reset <= now:
+        reset += ((now - reset) // WEEK_S + 1) * WEEK_S
+    return reset
 
 
 def relief_ts(name: str, now: float) -> float:
