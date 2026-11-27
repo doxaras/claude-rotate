@@ -44,8 +44,7 @@ R.HOLD_MAX_S = 0
 
 
 def fresh_state(active="a", accounts=None):
-    R.STATE = {"active_account": active, "accounts": accounts or {}, "events": [],
-               "last_switch_ts": 0}
+    R.STATE = R.State(active_account=active, accounts=accounts or {})
     R.AUDIT_PATH.write_text("")
 
 
@@ -120,7 +119,7 @@ async def race_handler(req):
 
 use_upstream(race_handler)
 resps, secs = blast(100)
-switches = [e for e in R.STATE["events"] if e["type"] == "switch"]
+switches = [e for e in R.STATE.events if e["type"] == "switch"]
 check("100 in-flight during quota hit: all recover to 200",
       all(r.status_code == 200 for r in resps))
 check("exactly one switch event despite 100 racers", len(switches) == 1,
@@ -129,7 +128,7 @@ check("in-flight herd hits the dying account at most once each",
       1 <= upstream_calls["a"] <= 100, f"{upstream_calls['a']} hits on a")
 check("survivor serves every request exactly once (no retry thrash)",
       upstream_calls["b"] == 100, f"{upstream_calls['b']} hits on b")
-check("active landed on b", R.STATE["active_account"] == "b")
+check("active landed on b", R.STATE.active_account == "b")
 check("audit final records all on b",
       all(rec["account"] == "b" for rec in audit_recs()))
 
@@ -151,8 +150,8 @@ resps, secs = blast(100)
 check("burst storm: all requests recover to 200",
       all(r.status_code == 200 for r in resps))
 check("burst storm: zero rotations",
-      not any(e["type"] == "switch" for e in R.STATE["events"])
-      and R.STATE["active_account"] == "a")
+      not any(e["type"] == "switch" for e in R.STATE.events)
+      and R.STATE.active_account == "a")
 
 # --- 4. concurrent holds: everyone parks, everyone finishes ------------------
 now = time.time()
@@ -178,7 +177,7 @@ resps, secs = blast(20)
 check("20 concurrent held requests all finish 200",
       all(r.status_code == 200 for r in resps))
 check("held ~deadline then released together", 1.5 <= secs < 20, f"{secs:.1f}s")
-check("hold events recorded", any(e["type"] == "hold" for e in R.STATE["events"]))
+check("hold events recorded", any(e["type"] == "hold" for e in R.STATE.events))
 R.HOLD_MAX_S = 0
 
 # --- 5. parallel SSE streams relay byte-identical ----------------------------
@@ -203,13 +202,13 @@ R.COOLDOWN_S = 0
 
 async def churn():
     for i in range(300):
-        active = R.STATE["active_account"]
+        active = R.STATE.active_account
         h = httpx.Headers({**unified(u5="1.0", status="rejected"),
                            "anthropic-ratelimit-unified-5h-reset": str(time.time() + 1000 + i)})
         await R.note_response(active, h, 429)
 asyncio.run(churn())
-check("events capped at 200 under churn", len(R.STATE["events"]) <= 200,
-      f"{len(R.STATE['events'])} events")
+check("events capped at 200 under churn", len(R.STATE.events) <= 200,
+      f"{len(R.STATE.events)} events")
 R.COOLDOWN_S = 300
 
 # --- 7. aggregate_audit stays fast on a big log ------------------------------

@@ -67,7 +67,7 @@ def call(path, key="devkey-1", body=None, method="POST"):
 
 
 def reset():
-    R.STATE = {"active_account": None, "accounts": {}, "events": [], "codex": {}}
+    R.STATE = R.State()
     R.AUDIT_PATH.write_text("")
 
 

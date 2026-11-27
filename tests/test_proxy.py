@@ -41,8 +41,7 @@ R.HOLD_MAX_S = 0
 
 
 def fresh_state(active="a", accounts=None):
-    R.STATE = {"active_account": active, "accounts": accounts or {}, "events": [],
-               "last_switch_ts": 0}
+    R.STATE = R.State(active_account=active, accounts=accounts or {})
     R.AUDIT_PATH.write_text("")
 
 
@@ -113,7 +112,7 @@ check("x-api-key stripped", seen["x-api-key"] is None)
 check("client anthropic-beta preserved", seen["beta"] == "oauth-2025-04-20")
 check("content-encoding dropped from response", "content-encoding" not in r.headers)
 check("state updated from unified headers",
-      R.STATE["accounts"]["a"]["util_5h"] == 0.5 and R.STATE["accounts"]["a"]["util_7d"] == 0.2)
+      R.STATE.accounts["a"]["util_5h"] == 0.5 and R.STATE.accounts["a"]["util_7d"] == 0.2)
 recs = audit_recs()
 check("audit written with usage + device + account",
       recs and recs[-1]["device"] == "laptop" and recs[-1]["account"] == "a"
@@ -181,7 +180,7 @@ use_upstream(quota_handler)
 r = call()
 check("quota 429 hidden from client, retry succeeds", r.status_code == 200)
 check("retry rode the next account", calls == ["Bearer tok-a", "Bearer tok-b"])
-check("active account rotated", R.STATE["active_account"] == "b")
+check("active account rotated", R.STATE.active_account == "b")
 recs = audit_recs()
 check("audit records final account + retry count",
       recs[-1]["account"] == "b" and recs[-1]["retries"] == 1 and recs[-1]["status"] == 200)
@@ -206,7 +205,7 @@ r = call()
 elapsed = time.time() - t0
 check("burst 429 hidden from client", r.status_code == 200)
 check("burst retried on the SAME account", calls == ["Bearer tok-a", "Bearer tok-a"])
-check("no rotation on burst", R.STATE["active_account"] == "a")
+check("no rotation on burst", R.STATE.active_account == "a")
 check("pace honored (~retry-after)", 0.9 <= elapsed < 5)
 
 # --- 6. every account spent, hold off → 429 passthrough ----------------------
@@ -252,7 +251,7 @@ r = call()
 elapsed = time.time() - t0
 check("held request eventually succeeds", r.status_code == 200 and len(calls) == 2)
 check("hold waited for the deadline window", 1.5 <= elapsed < 10)
-check("hold event recorded", any(e["type"] == "hold" for e in R.STATE["events"]))
+check("hold event recorded", any(e["type"] == "hold" for e in R.STATE.events))
 R.HOLD_MAX_S = 0
 
 # --- 8. admin endpoints ------------------------------------------------------
