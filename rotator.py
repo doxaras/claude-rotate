@@ -83,11 +83,11 @@ def load_config() -> dict:
             codex.append(acct)
         else:
             print(f"warning: skipping codex account '{acct['name']}' — no auth.json in "
-                  f"{home} (run: ./setup.sh add-codex-account {acct['name']})",
+                  f"{home} (run: ./setup.py add-codex-account {acct['name']})",
                   file=sys.stderr)
     cfg["codex_accounts"] = codex
     if not loaded and not codex:
-        raise SystemExit("no accounts with tokens configured — run: ./setup.sh add-account <name>")
+        raise SystemExit("no accounts with tokens configured — run: ./setup.py add-account <name>")
     # The example config ships a placeholder device key that is PUBLIC (it's in
     # the repo). It must never be accepted as a live credential: refuse to start
     # while one remains, so add-account-without-add-device can't open the proxy
@@ -97,7 +97,7 @@ def load_config() -> dict:
         raise SystemExit(
             f"placeholder device key(s) in config.json: {', '.join(bad)} — the example "
             "value is public and must never be a valid credential. "
-            "Run: ./setup.sh add-device <name> (it replaces the placeholder).")
+            "Run: ./setup.py add-device <name> (it replaces the placeholder).")
     return cfg
 
 
@@ -813,7 +813,7 @@ async def openai_images(request: Request):
                                        "type": "authentication_error"}}, status_code=401)
     if not CODEX_ACCOUNTS:
         return JSONResponse({"error": {"message": "claude-rotate: no codex accounts "
-                                                  "configured (./setup.sh add-codex-account)",
+                                                  "configured (./setup.py add-codex-account)",
                                        "type": "invalid_request_error"}}, status_code=503)
     try:
         body = json.loads(await request.body())
