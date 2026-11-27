@@ -101,10 +101,10 @@ home-lab Linux machine, a small VPS.
 ```bash
 git clone <this repo> && cd claude-rotate
 pip install -r requirements.txt
-./setup.sh                      # creates config.json, tokens/, logs/
-./setup.sh add-account acct-1   # paste token from: claude setup-token  (account 1's browser)
-./setup.sh add-account acct-2   # …account 2
-./setup.sh add-device my-laptop # prints the env vars for that device
+./setup.py                      # creates config.json, tokens/, logs/
+./setup.py add-account acct-1   # paste token from: claude setup-token  (account 1's browser)
+./setup.py add-account acct-2   # …account 2
+./setup.py add-device my-laptop # prints the env vars for that device
 python3 rotator.py
 ```
 
@@ -124,7 +124,7 @@ claude setup-token
   local callback (headless server, SSH session), it falls back to a paste-a-code
   flow — so you can mint tokens on the proxy server itself.
 - Prints a token starting `sk-ant-oat01-…` to the terminal and does **not**
-  save it anywhere — copy it straight into `./setup.sh add-account <name>`,
+  save it anywhere — copy it straight into `./setup.py add-account <name>`,
   which stores it under `tokens/` (chmod 600, gitignored).
 - Valid for **about one year**. Requires a Claude subscription (Pro, Max,
   Team, or Enterprise).
@@ -350,7 +350,7 @@ OpenAI-style as `b64_json`:
 
 ```bash
 npm i -g @openai/codex
-./setup.sh add-codex-account plus-1     # device-code login into codex/plus-1
+./setup.py add-codex-account plus-1     # device-code login into codex/plus-1
 curl -s http://my-server:8484/v1/images/generations \
   -H "Authorization: Bearer $DEVICE_KEY" -H "Content-Type: application/json" \
   -d '{"prompt": "a data centre at dusk", "size": "1536x1024"}'
@@ -479,7 +479,7 @@ config objects, not as a DSL.
 rejecting the *device* (the error body names claude-rotate, so it's not
 Anthropic). The device's `CLAUDE_CODE_OAUTH_TOKEN` doesn't match any entry in
 `config.json` `devices{}` — re-check the key, or re-run
-`./setup.sh add-device` and restart.
+`./setup.py add-device` and restart.
 
 **Client gets a 401 whose error body comes from Anthropic.** The *account
 token* the proxy swapped in was rejected upstream — on a previously working

@@ -35,7 +35,7 @@ jobs:
           mkdir -p tokens logs
           echo "sk-ant-oat01-ci-dummy-token" > tokens/acct-1.token
           echo "sk-ant-oat01-ci-dummy-token" > tokens/acct-2.token
-          ./setup.sh add-device ci-runner
+          ./setup.py add-device ci-runner
 
       - name: Run test suite
         run: python tests/run_all.py
