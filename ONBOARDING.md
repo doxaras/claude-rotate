@@ -31,11 +31,11 @@ cd /opt/claude-rotate            # or wherever it lives
 ```
 
 This mints the key `maria-laptop`, restarts the service so it's live, and
-prints a paste-ready welcome block (it uses `public_url` from `config.json`
+prints a paste-ready welcome block (it uses `public_url` from `config.json5`
 for the exact env values). Paste the block back to the requester over a
 reasonably private channel — the key is a bearer credential.
 
-**Revoke**: delete the device's entry from `config.json` `devices{}` and
+**Revoke**: delete the device's entry from `confidential.json` `devices{}` and
 `systemctl restart claude-rotate`. The panel's device roster shows every key
 (suffix only) with last-seen times, so stale devices are easy to spot.
 

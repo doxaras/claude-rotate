@@ -1,7 +1,6 @@
-# Local secrets and runtime state — never commit
-config.json
-tokens/
-*.token
+# Local secrets, settings and runtime state — never commit
+confidential.json
+config.json5
 state.json
 logs/
 __pycache__/
@@ -9,3 +8,8 @@ __pycache__/
 .DS_Store
 .omc/
 codex/
+# The old single-file layout, until ./setup.py migrate has run and they are deleted
+config.json
+config.json.migrated
+tokens/
+*.token

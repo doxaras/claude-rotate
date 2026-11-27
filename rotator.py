@@ -3,7 +3,7 @@
 Devices point at this proxy and authenticate with an internal device key:
 
     export ANTHROPIC_BASE_URL=http://my-server:8484   # over tailscale
-    export CLAUDE_CODE_OAUTH_TOKEN=<device key from config.json>
+    export CLAUDE_CODE_OAUTH_TOKEN=<device key from confidential.json>
 
 Per request, the proxy:
   1. maps the device key -> device name (401 if unknown),
@@ -31,6 +31,7 @@ from collections import deque
 from pathlib import Path
 
 import httpx
+import json5
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -39,7 +40,13 @@ import codex_image
 from oai_compat import SseToOai, anthropic_to_oai, oai_to_anthropic
 
 ROOT = Path(__file__).parent
-CONFIG_PATH = ROOT / "config.json"
+# Two files, split by who writes them: confidential.json holds the secrets and is
+# written by setup.py (account tokens, codex homes, device keys); config.json5 holds
+# the settings and is edited by hand (JSON5, so it can carry comments).
+CONFIDENTIAL_PATH = ROOT / "confidential.json"
+SETTINGS_PATH = ROOT / "config.json5"
+LEGACY_CONFIG_PATH = ROOT / "config.json"  # the single-file layout; ./setup.py migrate splits it
+CONFIDENTIAL_KEYS = ("accounts", "codex_accounts", "devices")
 STATE_PATH = ROOT / "state.json"
 AUDIT_PATH = ROOT / "logs" / "audit.jsonl"
 
@@ -55,40 +62,57 @@ state_lock = asyncio.Lock()
 
 
 def load_config() -> dict:
-    cfg = json.loads(CONFIG_PATH.read_text())
+    """The settings from config.json5 (every key optional) with the accounts and
+    devices from confidential.json merged in, in the shape the rest of this module
+    reads: accounts and codex_accounts as lists of dicts carrying their name, their
+    token or codex_home and their account_options; devices as name -> key."""
+    if not CONFIDENTIAL_PATH.exists():
+        if LEGACY_CONFIG_PATH.exists():
+            raise SystemExit("config.json is the old single-file layout — run: ./setup.py migrate")
+        raise SystemExit("no confidential.json — run: ./setup.py, then add-account and add-device")
+    confidential = json.loads(CONFIDENTIAL_PATH.read_text())
+    cfg = json5.loads(SETTINGS_PATH.read_text()) if SETTINGS_PATH.exists() else {}
+    misplaced = [k for k in CONFIDENTIAL_KEYS if k in cfg]
+    if misplaced:
+        raise SystemExit(f"config.json5 has {', '.join(misplaced)} — those live in "
+                         "confidential.json (written by ./setup.py); per-account settings go "
+                         "under account_options")
+    options = cfg.get("account_options") or {}
+    unknown = set(options) - set(confidential.get("accounts") or {}) - set(confidential.get("codex_accounts") or {})
+    if unknown:
+        print(f"warning: account_options for unknown account(s): {', '.join(sorted(unknown))}",
+              file=sys.stderr)
     loaded = []
-    for acct in cfg["accounts"]:
-        path = ROOT / acct["token_file"]
-        if path.exists():
-            acct["token"] = path.read_text().strip()
-            loaded.append(acct)
+    for name, token in (confidential.get("accounts") or {}).items():
+        if isinstance(token, str) and token.strip():
+            loaded.append({**options.get(name, {}), "name": name, "token": token.strip()})
         else:
-            print(f"warning: skipping account '{acct['name']}' — {acct['token_file']} not found",
-                  file=sys.stderr)
+            print(f"warning: skipping account '{name}' — no token in confidential.json "
+                  f"(run: ./setup.py add-account {name})", file=sys.stderr)
     cfg["accounts"] = loaded
     codex = []
-    for acct in cfg.get("codex_accounts") or []:
-        home = Path(acct["codex_home"]).expanduser()
+    for name, codex_home in (confidential.get("codex_accounts") or {}).items():
+        home = Path(codex_home).expanduser()
         if not home.is_absolute():
             home = ROOT / home
         if (home / "auth.json").exists():
-            acct["codex_home"] = str(home)
-            codex.append(acct)
+            codex.append({**options.get(name, {}), "name": name, "codex_home": str(home)})
         else:
-            print(f"warning: skipping codex account '{acct['name']}' — no auth.json in "
-                  f"{home} (run: ./setup.py add-codex-account {acct['name']})",
+            print(f"warning: skipping codex account '{name}' — no auth.json in "
+                  f"{home} (run: ./setup.py add-codex-account {name})",
                   file=sys.stderr)
     cfg["codex_accounts"] = codex
+    cfg["devices"] = confidential.get("devices") or {}
     if not loaded and not codex:
         raise SystemExit("no accounts with tokens configured — run: ./setup.py add-account <name>")
-    # The example config ships a placeholder device key that is PUBLIC (it's in
-    # the repo). It must never be accepted as a live credential: refuse to start
-    # while one remains, so add-account-without-add-device can't open the proxy
-    # to anyone who read the example (GitHub issue #2).
-    bad = [d for d, k in (cfg.get("devices") or {}).items() if "REPLACE-WITH" in k]
+    # The old example config shipped a placeholder device key that is PUBLIC (it's
+    # in the repo's history). It must never be accepted as a live credential:
+    # refuse to start while one remains, so a migrated install that never ran
+    # add-device can't open the proxy to anyone who read the example (GitHub issue #2).
+    bad = [d for d, k in cfg["devices"].items() if "REPLACE-WITH" in k]
     if bad:
         raise SystemExit(
-            f"placeholder device key(s) in config.json: {', '.join(bad)} — the example "
+            f"placeholder device key(s) in confidential.json: {', '.join(bad)} — the example "
             "value is public and must never be a valid credential. "
             "Run: ./setup.py add-device <name> (it replaces the placeholder).")
     return cfg
@@ -357,7 +381,7 @@ def device_from_request(request: Request) -> str | None:
 
 # API list prices per MTok (input, output), matched by substring of the model id.
 # Cost columns are *API-equivalent* dollars: what this usage would cost pay-per-token.
-# Override in config.json under "prices_per_mtok".
+# Override in config.json5 under "prices_per_mtok" (replaces this table as a whole).
 PRICES = CFG.get("prices_per_mtok", {
     "fable": [10.0, 50.0], "mythos": [10.0, 50.0],
     "opus": [5.0, 25.0],
@@ -365,11 +389,13 @@ PRICES = CFG.get("prices_per_mtok", {
     "haiku": [1.0, 5.0],
 })
 DEFAULT_PRICE = [5.0, 25.0]
-ALERT_CFG = CFG.get("alerts", {
+# config.json5's "alerts" overrides these key by key.
+ALERT_CFG = {
     "device_tokens_per_hour": 5_000_000,
     "expensive_model_patterns": ["opus", "fable", "mythos"],
     "util_warn": 0.8,
-})
+    **CFG.get("alerts", {}),
+}
 
 
 def price_for(model: str | None) -> list[float]:
