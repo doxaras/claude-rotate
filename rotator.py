@@ -42,6 +42,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import codex_image
+from confidential import CONFIDENTIAL_SECTIONS, read_confidential
 from oai_compat import SseToOai, anthropic_to_oai, oai_to_anthropic
 
 ROOT = Path(__file__).parent
@@ -146,15 +147,6 @@ class Config:
     codex: Codex_config = field(default_factory=Codex_config)
 
 
-@dataclass(slots=True)
-class Confidential:
-    """confidential.json: the secrets, written only by setup.py. A section left
-    out, or null, is empty."""
-    accounts: dict[str, str] = field(default_factory=dict)  # Claude account name -> setup-token
-    codex_accounts: dict[str, str] = field(default_factory=dict)  # Codex account name -> CODEX_HOME
-    devices: dict[str, str] = field(default_factory=dict)  # device name -> device key
-
-
 def load_config() -> Config:
     """config.json5 and confidential.json as one Config. account_options are
     merged into the accounts they name."""
@@ -162,11 +154,9 @@ def load_config() -> Config:
         if LEGACY_CONFIG_PATH.exists():
             raise SystemExit("config.json is the old single-file layout — run: ./setup.py migrate")
         raise SystemExit("no confidential.json — run: ./setup.py, then add-account and add-device")
-    data = json.loads(CONFIDENTIAL_PATH.read_text())
-    confidential = from_json(Confidential, {k: v for k, v in data.items() if v is not None},
-                             "confidential.json")
+    confidential = read_confidential(CONFIDENTIAL_PATH)
     cfg = json5.loads(SETTINGS_PATH.read_text()) if SETTINGS_PATH.exists() else {}
-    misplaced = [f.name for f in fields(Confidential) if f.name in cfg]
+    misplaced = [k for k in CONFIDENTIAL_SECTIONS if k in cfg]
     if misplaced:
         raise SystemExit(f"config.json5 has {', '.join(misplaced)} — those live in "
                          "confidential.json (written by ./setup.py); per-account settings go "

@@ -33,6 +33,8 @@ import sys
 import time
 from pathlib import Path
 
+from confidential import CONFIDENTIAL_SECTIONS, Confidential, read_confidential, write_confidential
+
 ROOT = Path(__file__).resolve().parent
 CONFIDENTIAL = ROOT / "confidential.json"
 SETTINGS = ROOT / "config.json5"
@@ -42,31 +44,16 @@ LEGACY_BACKUP = ROOT / "config.json.migrated"
 LEGACY_TOKENS = ROOT / "tokens"
 LOGS = ROOT / "logs"
 CODEX = ROOT / "codex"
-CONFIDENTIAL_KEYS = ("accounts", "codex_accounts", "devices")
 TOKEN_PREFIX = "sk-ant-oat01-"
 PLACEHOLDER = "REPLACE-WITH"
 
 
-def write_private(path: Path, text: str) -> None:
-    """Write through a temporary file created 0600 and a rename: no reader ever
-    sees half a file, and the secrets inside are never world-readable."""
-    tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(text)
-    os.chmod(tmp, 0o600)  # O_CREAT's mode only applies to a new file
-    tmp.replace(path)
+def load_confidential() -> Confidential:
+    return read_confidential(CONFIDENTIAL)
 
 
-def load_confidential() -> dict:
-    confidential = json.loads(CONFIDENTIAL.read_text())
-    for key in CONFIDENTIAL_KEYS:
-        confidential.setdefault(key, {})
-    return confidential
-
-
-def save_confidential(confidential: dict) -> None:
-    write_private(CONFIDENTIAL, json.dumps(confidential, indent=2) + "\n")
+def save_confidential(confidential: Confidential) -> None:
+    write_confidential(CONFIDENTIAL, confidential)
 
 
 def public_url() -> str:
@@ -110,11 +97,11 @@ def migrate() -> bool:
         extra = {k: v for k, v in acct.items() if k not in ("name", "codex_home")}
         if extra:
             options[acct["name"]] = extra
-    settings = {k: v for k, v in legacy.items() if k not in CONFIDENTIAL_KEYS}
+    settings = {k: v for k, v in legacy.items() if k not in CONFIDENTIAL_SECTIONS}
     if options:
         settings["account_options"] = {**(settings.get("account_options") or {}), **options}
-    save_confidential({"accounts": accounts, "codex_accounts": codex,
-                       "devices": legacy.get("devices") or {}})
+    save_confidential(Confidential(accounts=accounts, codex_accounts=codex,
+                                   devices=legacy.get("devices") or {}))
     if SETTINGS.exists():
         print("config.json5 already exists — left as it is; the old settings stay in "
               f"{LEGACY_BACKUP.name}")
@@ -138,7 +125,7 @@ def prepare() -> bool:
     LOGS.mkdir(exist_ok=True)
     migrated = migrate()
     if not CONFIDENTIAL.exists():
-        save_confidential({key: {} for key in CONFIDENTIAL_KEYS})
+        save_confidential(Confidential())
         print("created confidential.json (account tokens and device keys — fill it with the "
               "subcommands below)")
     if not SETTINGS.exists():
@@ -171,9 +158,9 @@ def register_device(name: str) -> str:
     """Mint a key for `name`, store it (dropping any placeholder) and return it."""
     key = f"dev-{name}-{secrets.token_hex(8)}"
     confidential = load_confidential()
-    devices = {k: v for k, v in confidential["devices"].items() if PLACEHOLDER not in v}
+    devices = {k: v for k, v in confidential.devices.items() if PLACEHOLDER not in v}
     devices[name] = key
-    confidential["devices"] = devices
+    confidential.devices = devices
     save_confidential(confidential)
     return key
 
@@ -211,7 +198,7 @@ def cmd_onboard(args: argparse.Namespace) -> int:
     # <username>-<device>, restarts the service so it's live immediately.
     user, dev = args.username, args.device
     name = f"{user}-{dev}"
-    if name in load_confidential()["devices"]:
+    if name in load_confidential().devices:
         print(f"error: device '{name}' already exists — revoke it first (delete it from "
               "confidential.json) or pick another name", file=sys.stderr)
         return 1
@@ -249,7 +236,7 @@ def cmd_add_account(args: argparse.Namespace) -> int:
         print(f"error: token should start with {TOKEN_PREFIX}", file=sys.stderr)
         return 1
     confidential = load_confidential()
-    confidential["accounts"][args.name] = token
+    confidential.accounts[args.name] = token
     save_confidential(confidential)
     print(f"account '{args.name}' stored. Restart rotator.py to load it.")
     return 0
@@ -273,7 +260,7 @@ def cmd_add_codex_account(args: argparse.Namespace) -> int:
     if login.returncode != 0:
         return login.returncode
     confidential = load_confidential()
-    confidential["codex_accounts"].setdefault(args.name, f"codex/{args.name}")
+    confidential.codex_accounts.setdefault(args.name, f"codex/{args.name}")
     save_confidential(confidential)
     print(f"codex account '{args.name}' stored. Restart rotator.py to load it.")
     return 0
