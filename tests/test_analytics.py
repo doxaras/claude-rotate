@@ -59,8 +59,8 @@ tmp = Path(tempfile.mkdtemp())
 R.AUDIT_PATH = tmp / "audit.jsonl"
 R.CFG["devices"] = {"laptop": "key-laptop-abcd", "ci-box": "key-ci-efgh", "idle-dev": "key-idle-ijkl"}
 R.ACCOUNTS = {"a": {"name": "a"}, "b": {"name": "b"}}
-R.STATE = {"active_account": "a", "events": [],
-           "accounts": {"a": {"util_5h": 0.85, "reset_5h": time.time() + 3600}, "b": {}}}
+R.STATE = R.State(active_account="a",
+                  accounts={"a": R.Account(util_5h=0.85, reset_5h=time.time() + 3600), "b": R.Account()})
 
 FMT = "%Y-%m-%dT%H:%M:%S%z"
 now = time.time()

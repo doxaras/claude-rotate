@@ -28,7 +28,9 @@ import os
 import sys
 import time
 from collections import deque
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+from typing import ClassVar, TypeVar
 
 import httpx
 import uvicorn
@@ -110,17 +112,95 @@ CODEX_CFG = CFG.get("codex", {})
 codex_slots = asyncio.Semaphore(CODEX_CFG.get("concurrency", 2))
 
 
-def load_state() -> dict:
-    if STATE_PATH.exists():
-        state = json.loads(STATE_PATH.read_text())
-    else:
-        state = {
-            "active_account": CFG["accounts"][0]["name"] if CFG["accounts"] else None,
-            "accounts": {a["name"]: {} for a in CFG["accounts"]},
-            "events": [],
-        }
-    state.setdefault("codex", {})
-    return state
+T = TypeVar("T")
+
+
+def from_json(cls: type[T], data: dict, where: str) -> T:
+    """Dataclass `cls` from its JSON object. A key it has no field for is
+    dropped with a warning: a state.json from another version must not stop
+    the proxy from starting."""
+    known = {f.name for f in fields(cls)}
+    unknown = sorted(set(data) - known)
+    if unknown:
+        print(f"warning: ignoring unknown key(s) in {where}: {', '.join(unknown)}",
+              file=sys.stderr)
+    return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass(slots=True)
+class Account:
+    """What a Claude account's last replies said (the anthropic-ratelimit-unified-*
+    headers). An account with no reply yet has the defaults: nothing used, no
+    known reset."""
+    util_5h: float = 0.0
+    util_7d: float = 0.0
+    reset_5h: float | None = None  # epoch seconds
+    reset_7d: float | None = None
+    status: str | None = None  # "allowed", "rejected", ...
+    last_seen: float | None = None
+    pace_until: float = 0.0  # a per-minute burst 429 holds requests back until then
+
+
+@dataclass(slots=True)
+class Event:
+    """One switch or hold, for /rotate/status. In JSON the two accounts are
+    "from" and "to" (`from` is a Python keyword)."""
+    ts: str
+    type: str  # "switch" or "hold"
+    from_account: str
+    to_account: str
+    reason: str
+    util: float | None = None  # a switch: the 5h utilization of the account it left
+
+    JSON_KEYS: ClassVar[dict[str, str]] = {"from_account": "from", "to_account": "to"}
+
+    @classmethod
+    def from_json(cls, data: dict) -> "Event":
+        field_names = {v: k for k, v in cls.JSON_KEYS.items()}
+        return from_json(cls, {field_names.get(k, k): v for k, v in data.items()},
+                         "a state.json event")
+
+    def to_json(self) -> dict:
+        return {self.JSON_KEYS.get(k, k): v for k, v in asdict(self).items()}
+
+
+@dataclass(slots=True)
+class State:
+    """What the proxy keeps across restarts; persisted as state.json."""
+    active_account: str | None = None
+    accounts: dict[str, Account] = field(default_factory=dict)
+    events: list[Event] = field(default_factory=list)  # newest last, the last 200 kept
+    last_switch_ts: float = 0
+    codex: dict[str, codex_image.Codex_account] = field(default_factory=dict)
+
+    @classmethod
+    def from_json(cls, data: dict) -> "State":
+        state = from_json(cls, data, "state.json")
+        state.accounts = {name: from_json(Account, info, f"state.json account {name!r}")
+                          for name, info in state.accounts.items()}
+        events = []
+        for event in state.events:
+            try:
+                events.append(Event.from_json(event))
+            except TypeError as e:  # a required field missing
+                print(f"warning: dropping a state.json event ({e}): {event}", file=sys.stderr)
+        state.events = events
+        state.codex = {name: from_json(codex_image.Codex_account, info,
+                                       f"state.json codex account {name!r}")
+                       for name, info in state.codex.items()}
+        return state
+
+    def to_json(self) -> dict:
+        data = asdict(self)
+        data["events"] = [e.to_json() for e in self.events]
+        return data
+
+
+def load_state() -> State:
+    if not STATE_PATH.exists():
+        return State(active_account=CFG["accounts"][0]["name"] if CFG["accounts"] else None,
+                     accounts={a["name"]: Account() for a in CFG["accounts"]})
+    return State.from_json(json.loads(STATE_PATH.read_text()))
 
 
 STATE = load_state()
@@ -130,7 +210,7 @@ def save_state() -> None:
     # Write-then-rename so a crash mid-write can never leave a truncated
     # state.json (which would refuse to parse on the next start).
     tmp = STATE_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(STATE, indent=2))
+    tmp.write_text(json.dumps(STATE.to_json(), indent=2))
     tmp.replace(STATE_PATH)
 
 
@@ -141,19 +221,19 @@ def audit(rec: dict) -> None:
 
 
 def utilization(name: str) -> float:
-    info = STATE["accounts"].get(name, {})
+    info = STATE.accounts.get(name, Account())
     now = time.time()
     # A window that has reset no longer counts against the account.
-    if info.get("reset_5h") and now >= info["reset_5h"]:
+    if info.reset_5h and now >= info.reset_5h:
         return 0.0
-    return info.get("util_5h", 0.0)
+    return info.util_5h
 
 
 def util_7d(name: str) -> float:
-    info = STATE["accounts"].get(name, {})
-    if info.get("reset_7d") and time.time() >= info["reset_7d"]:
+    info = STATE.accounts.get(name, Account())
+    if info.reset_7d and time.time() >= info.reset_7d:
         return 0.0
-    return info.get("util_7d", 0.0)
+    return info.util_7d
 
 
 def priority(name: str) -> int:
@@ -171,14 +251,14 @@ def usable(name: str) -> bool:
 
 
 def weekly_reset(name: str) -> float:
-    return STATE["accounts"].get(name, {}).get("reset_7d") or float("inf")
+    return STATE.accounts.get(name, Account()).reset_7d or float("inf")
 
 
 def earliest_relief() -> float:
     """Soonest moment any account's 5h window resets (for hold-until-reset)."""
     now = time.time()
-    resets = [i.get("reset_5h") for i in STATE["accounts"].values()
-              if i.get("reset_5h") and i["reset_5h"] > now]
+    resets = [i.reset_5h for i in STATE.accounts.values()
+              if i.reset_5h and i.reset_5h > now]
     return min(resets) if resets else now + 300
 
 
@@ -198,7 +278,7 @@ def pick_account() -> str:
             return min(under, key=lambda n: (priority(n), weekly_reset(n), utilization(n)))
         return min(under, key=lambda n: (priority(n), utilization(n)))
     pool = [n for n in ACCOUNTS if not disabled(n)] or list(ACCOUNTS)
-    return min(pool, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
+    return min(pool, key=lambda n: STATE.accounts.get(n, Account()).reset_5h or 0)
 
 
 async def note_response(account: str, headers: httpx.Headers, status: int) -> str | None:
@@ -213,7 +293,7 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
         return float(v) if v is not None else None
 
     async with state_lock:
-        info = STATE["accounts"].setdefault(account, {})
+        info = STATE.accounts.setdefault(account, Account())
         for key, header in (
             ("util_5h", "anthropic-ratelimit-unified-5h-utilization"),
             ("util_7d", "anthropic-ratelimit-unified-7d-utilization"),
@@ -222,13 +302,13 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
         ):
             val = _f(header)
             if val is not None:
-                info[key] = val
+                setattr(info, key, val)
         if headers.get("anthropic-ratelimit-unified-status"):
-            info["status"] = headers["anthropic-ratelimit-unified-status"]
+            info.status = headers["anthropic-ratelimit-unified-status"]
         now = time.time()
-        info["last_seen"] = now
+        info.last_seen = now
 
-        quota_hit = info.get("status") == "rejected" or (
+        quota_hit = info.status == "rejected" or (
             status == 429 and (utilization(account) >= 1.0 or util_7d(account) >= 1.0))
         if status == 429 and not quota_hit:
             # Per-minute burst limit, not spent quota. Rotating would just move
@@ -238,16 +318,16 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
                 pace = min(float(headers.get("retry-after", "")), 60.0)
             except ValueError:
                 pace = 15.0
-            info["pace_until"] = now + pace
+            info.pace_until = now + pace
             save_state()
             return "burst"
 
         verdict = None
-        if STATE["active_account"] != account:
+        if STATE.active_account != account:
             # Another request already rotated; a retry rides the new active.
             verdict = "switched" if quota_hit else None
         else:
-            cooled = now - STATE.get("last_switch_ts", 0) >= COOLDOWN_S
+            cooled = now - STATE.last_switch_ts >= COOLDOWN_S
             over = utilization(account) >= THRESHOLD or util_7d(account) >= THRESHOLD_7D
             nxt = pick_account()
             reason = None
@@ -275,16 +355,16 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
                         # weekly window expires clearly sooner than the active one's.
                         reason = "consume_first"
             if reason:
-                STATE["active_account"] = nxt
-                STATE["last_switch_ts"] = now
-                STATE["events"].append({
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "type": "switch",
-                    "from": account, "to": nxt,
-                    "reason": reason,
-                    "util": utilization(account),
-                })
-                STATE["events"] = STATE["events"][-200:]
+                STATE.active_account = nxt
+                STATE.last_switch_ts = now
+                STATE.events.append(Event(
+                    ts=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    type="switch",
+                    from_account=account, to_account=nxt,
+                    reason=reason,
+                    util=utilization(account),
+                ))
+                STATE.events = STATE.events[-200:]
                 verdict = "switched"
             elif quota_hit:
                 verdict = "exhausted"
@@ -321,7 +401,7 @@ async def rotate_status(request: Request):
     now = time.time()
     accounts = {}
     for name in ACCOUNTS:
-        info = dict(STATE["accounts"].get(name, {}))
+        info = asdict(STATE.accounts.get(name, Account()))
         info["effective_util_5h"] = utilization(name)
         info["effective_util_7d"] = util_7d(name)
         info["priority"] = priority(name)
@@ -332,18 +412,18 @@ async def rotate_status(request: Request):
             info["reset_7d_in_h"] = max(0, round((info["reset_7d"] - now) / 3600, 1))
         accounts[name] = info
     return {
-        "active_account": STATE["active_account"],
+        "active_account": STATE.active_account,
         "switch_threshold": THRESHOLD,
         "switch_threshold_7d": THRESHOLD_7D,
         "strategy": STRATEGY,
         "hold_max_s": HOLD_MAX_S,
         "accounts": accounts,
         "codex_accounts": {
-            name: dict(STATE.setdefault("codex", {}).get(name, {}),
-                       usable=codex_image.usable(name, CODEX_ACCOUNTS, STATE["codex"],
+            name: dict(asdict(STATE.codex.get(name, codex_image.Codex_account())),
+                       usable=codex_image.usable(name, CODEX_ACCOUNTS, STATE.codex,
                                                  THRESHOLD, THRESHOLD_7D, now))
             for name in CODEX_ACCOUNTS},
-        "recent_events": STATE["events"][-10:],
+        "recent_events": [e.to_json() for e in STATE.events[-10:]],
     }
 
 
@@ -617,9 +697,9 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
     noted = False
     verdict = None
     while True:
-        account = STATE["active_account"]
+        account = STATE.active_account
         fwd_headers["authorization"] = f"Bearer {ACCOUNTS[account]['token']}"
-        pace = STATE["accounts"].get(account, {}).get("pace_until", 0) - time.time()
+        pace = STATE.accounts.get(account, Account()).pace_until - time.time()
         if pace > 0:
             await asyncio.sleep(min(pace, 60))
         upstream = await client.send(
@@ -643,11 +723,11 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
         retries += 1
         if wait > 0:
             async with state_lock:
-                STATE["events"].append({
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "hold",
-                    "from": account, "to": account,
-                    "reason": f"all accounts spent; holding {round(wait)}s"})
-                STATE["events"] = STATE["events"][-200:]
+                STATE.events.append(Event(
+                    ts=time.strftime("%Y-%m-%dT%H:%M:%S%z"), type="hold",
+                    from_account=account, to_account=account,
+                    reason=f"all accounts spent; holding {round(wait)}s"))
+                STATE.events = STATE.events[-200:]
                 save_state()
             await asyncio.sleep(wait)
 
@@ -779,7 +859,7 @@ async def openai_images(request: Request):
     async with codex_slots:
         result = await codex_image.generate(
             prompt, body.get("size"), accounts=CODEX_ACCOUNTS,
-            state=STATE.setdefault("codex", {}), runner=codex_image.run_codex,
+            state=STATE.codex, runner=codex_image.run_codex,
             codex_bin=CODEX_CFG.get("bin", "codex"),
             model=CODEX_CFG.get("model", "gpt-6.1-sol"),
             effort=CODEX_CFG.get("reasoning_effort", "low"),
