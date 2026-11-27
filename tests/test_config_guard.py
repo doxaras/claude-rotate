@@ -55,6 +55,11 @@ def test_real_keys_boot():
     assert cfg.codex_accounts == []
 
 
+def test_null_or_unknown_confidential_sections_are_not_fatal():
+    cfg = _load_with({"accounts": ACCT, "codex_accounts": None, "devices": DEV, "newer": {}})
+    assert cfg.codex_accounts == [] and cfg.devices == DEV
+
+
 def test_account_without_token_is_skipped_not_fatal():
     cfg = _load_with({"accounts": {**ACCT, "b": ""}, "devices": DEV})
     assert [a.name for a in cfg.accounts] == ["a"]
