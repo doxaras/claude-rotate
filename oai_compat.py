@@ -1,7 +1,7 @@
 """OpenAI chat.completions <-> Anthropic /v1/messages translation (Phase 3).
 
 Pure functions + one incremental SSE translator, deliberately import-safe with no
-config dependency so they can be unit-tested offline (rotator.py needs config.json
+config dependency so they can be unit-tested offline (rotator.py needs confidential.json
 at import; this module needs nothing).
 
 Scope: text conversations. Tool use is REFUSED loudly (400) rather than

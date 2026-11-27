@@ -32,7 +32,11 @@ def fresh_state(active="a"):
     R.STATE = {"active_account": active, "accounts": {}, "events": [], "last_switch_ts": 0}
 
 
-R.ACCOUNTS = {"a": {"name": "a"}, "b": {"name": "b"}, "c": {"name": "c"}}
+def acct(name, **options):
+    return R.Account_config(name=name, token="", **options)
+
+
+R.ACCOUNTS = {n: acct(n) for n in "abc"}
 R.THRESHOLD, R.THRESHOLD_7D = 0.8, 0.98
 R.STRATEGY, R.COOLDOWN_S, R.SWITCH_MARGIN, R.CF_MARGIN_S = "consume-first", 300, 0.05, 3600
 run = asyncio.run
@@ -143,8 +147,7 @@ check("passed 5h reset → util 0", R.utilization("a") == 0.0)
 check("passed 7d reset → util 0", R.util_7d("a") == 0.0)
 
 # 9. priority tiers: preferred tier always beats a sooner weekly reset
-R.ACCOUNTS = {"a": {"name": "a", "priority": 2},
-              "b": {"name": "b", "priority": 1}, "c": {"name": "c", "priority": 1}}
+R.ACCOUNTS = {"a": acct("a", priority=2), "b": acct("b", priority=1), "c": acct("c", priority=1)}
 fresh_state()
 R.STATE["accounts"] = {
     "a": {"util_5h": 0.1, "util_7d": 0.1, "reset_7d": now + 1000},    # soonest, but backup tier
@@ -177,7 +180,7 @@ v = run(R.note_response("a", headers(u5=0.2), 200))
 check("priority recovery respects cooldown", v is None and R.STATE["active_account"] == "a")
 
 # 11. disabled accounts: never picked, active one abandoned immediately
-R.ACCOUNTS = {"a": {"name": "a", "disabled": True}, "b": {"name": "b"}, "c": {"name": "c"}}
+R.ACCOUNTS = {"a": acct("a", disabled=True), "b": acct("b"), "c": acct("c")}
 fresh_state("a")
 R.STATE["accounts"] = {"a": {"util_5h": 0.0}, "b": {"util_5h": 0.2}, "c": {"util_5h": 0.1}}
 check("disabled excluded from pick", R.pick_account() == "c")

@@ -3,7 +3,7 @@
 Devices point at this proxy and authenticate with an internal device key:
 
     export ANTHROPIC_BASE_URL=http://my-server:8484   # over tailscale
-    export CLAUDE_CODE_OAUTH_TOKEN=<device key from config.json>
+    export CLAUDE_CODE_OAUTH_TOKEN=<device key from confidential.json>
 
 Per request, the proxy:
   1. maps the device key -> device name (401 if unknown),
@@ -28,18 +28,27 @@ import os
 import sys
 import time
 from collections import deque
+from dataclasses import dataclass, field, fields
 from pathlib import Path
+from typing import TypeVar
 
 import httpx
+import json5
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import codex_image
+from confidential import CONFIDENTIAL_SECTIONS, read_confidential
 from oai_compat import SseToOai, anthropic_to_oai, oai_to_anthropic
 
 ROOT = Path(__file__).parent
-CONFIG_PATH = ROOT / "config.json"
+# Two files, split by who writes them: confidential.json holds the secrets and is
+# written by setup.py (account tokens, codex homes, device keys); config.json5 holds
+# the settings and is edited by hand (JSON5, so it can carry comments).
+CONFIDENTIAL_PATH = ROOT / "confidential.json"
+SETTINGS_PATH = ROOT / "config.json5"
+LEGACY_CONFIG_PATH = ROOT / "config.json"  # the single-file layout; ./setup.py migrate splits it
 STATE_PATH = ROOT / "state.json"
 AUDIT_PATH = ROOT / "logs" / "audit.jsonl"
 
@@ -54,60 +63,159 @@ client = httpx.AsyncClient(base_url=UPSTREAM, timeout=httpx.Timeout(600.0, conne
 state_lock = asyncio.Lock()
 
 
-def load_config() -> dict:
-    cfg = json.loads(CONFIG_PATH.read_text())
+T = TypeVar("T")
+
+
+def from_json(cls: type[T], data: dict, where: str) -> T:
+    """Dataclass `cls` from its JSON object. A key it has no field for is
+    dropped with a warning: a misspelt config.json5 key, or a file from another
+    version, must not stop the proxy from starting."""
+    known = {f.name for f in fields(cls)}
+    unknown = sorted(set(data) - known)
+    if unknown:
+        print(f"warning: ignoring unknown key(s) in {where}: {', '.join(unknown)}",
+              file=sys.stderr)
+    return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass(slots=True)
+class Account_config:
+    """A Claude account: its setup-token from confidential.json and its
+    account_options from config.json5."""
+    name: str
+    token: str
+    priority: int = 100  # lower = preferred tier
+    disabled: bool = False  # benched: never picked, left at once when active
+
+
+@dataclass(slots=True)
+class Alerts_config:
+    """config.json5's "alerts": when the panel warns."""
+    device_tokens_per_hour: int = 5_000_000  # one device's tokens in the last hour
+    expensive_model_patterns: list[str] = field(
+        default_factory=lambda: ["opus", "fable", "mythos"])  # model id substrings
+    util_warn: float = 0.8  # an account's 5h utilization
+
+
+@dataclass(slots=True)
+class Codex_config:
+    """config.json5's "codex": image generation through the Codex CLI."""
+    bin: str = "codex"
+    model: str = "gpt-6.1-sol"
+    reasoning_effort: str = "low"
+    timeout_s: float = 300  # per image
+    concurrency: int = 2  # images generated at once
+
+
+# API list prices per MTok (input, output), matched by substring of the model id.
+# Cost columns are *API-equivalent* dollars: what this usage would cost pay-per-token.
+# config.json5's "prices_per_mtok" replaces this table as a whole.
+DEFAULT_PRICES = {
+    "fable": [10.0, 50.0], "mythos": [10.0, 50.0],
+    "opus": [5.0, 25.0],
+    "sonnet": [3.0, 15.0],
+    "haiku": [1.0, 5.0],
+}
+
+
+@dataclass(slots=True)
+class Config:
+    """The settings from config.json5, every one optional, with the accounts and
+    devices from confidential.json. config.example.json5 documents the settings."""
+    accounts: list[Account_config]  # only those with a token
+    codex_accounts: list[codex_image.Codex_account_config]  # only those signed in
+    devices: dict[str, str]  # device name -> device key
+    bind: str = "127.0.0.1"
+    port: int = 8484
+    public_url: str = ""  # read by setup.py
+    switch_threshold: float = 0.8
+    switch_threshold_7d: float = 0.98
+    strategy: str = "consume-first"  # or "least-used"
+    switch_cooldown_s: float = 300
+    switch_margin: float = 0.05
+    consume_first_margin_s: float = 3600
+    hold_max_s: float = 0  # 0 = return 429 when every account is spent
+    prices_per_mtok: dict[str, list[float]] = field(default_factory=lambda: dict(DEFAULT_PRICES))
+    alerts: Alerts_config = field(default_factory=Alerts_config)
+    codex: Codex_config = field(default_factory=Codex_config)
+
+
+def load_config() -> Config:
+    """config.json5 and confidential.json as one Config. account_options are
+    merged into the accounts they name."""
+    if not CONFIDENTIAL_PATH.exists():
+        if LEGACY_CONFIG_PATH.exists():
+            raise SystemExit("config.json is the old single-file layout — run: ./setup.py migrate")
+        raise SystemExit("no confidential.json — run: ./setup.py, then add-account and add-device")
+    confidential = read_confidential(CONFIDENTIAL_PATH)
+    cfg = json5.loads(SETTINGS_PATH.read_text()) if SETTINGS_PATH.exists() else {}
+    misplaced = [k for k in CONFIDENTIAL_SECTIONS if k in cfg]
+    if misplaced:
+        raise SystemExit(f"config.json5 has {', '.join(misplaced)} — those live in "
+                         "confidential.json (written by ./setup.py); per-account settings go "
+                         "under account_options")
+    options = cfg.pop("account_options", None) or {}
+    unknown = set(options) - set(confidential.accounts) - set(confidential.codex_accounts)
+    if unknown:
+        print(f"warning: account_options for unknown account(s): {', '.join(sorted(unknown))}",
+              file=sys.stderr)
     loaded = []
-    for acct in cfg["accounts"]:
-        path = ROOT / acct["token_file"]
-        if path.exists():
-            acct["token"] = path.read_text().strip()
-            loaded.append(acct)
+    for name, token in confidential.accounts.items():
+        if isinstance(token, str) and token.strip():
+            loaded.append(from_json(Account_config,
+                                    {**options.get(name, {}), "name": name, "token": token.strip()},
+                                    f"config.json5 account_options {name!r}"))
         else:
-            print(f"warning: skipping account '{acct['name']}' — {acct['token_file']} not found",
-                  file=sys.stderr)
-    cfg["accounts"] = loaded
+            print(f"warning: skipping account '{name}' — no token in confidential.json "
+                  f"(run: ./setup.py add-account {name})", file=sys.stderr)
     codex = []
-    for acct in cfg.get("codex_accounts") or []:
-        home = Path(acct["codex_home"]).expanduser()
+    for name, codex_home in confidential.codex_accounts.items():
+        home = Path(codex_home).expanduser()
         if not home.is_absolute():
             home = ROOT / home
         if (home / "auth.json").exists():
-            acct["codex_home"] = str(home)
-            codex.append(acct)
+            codex.append(from_json(codex_image.Codex_account_config,
+                                   {**options.get(name, {}), "name": name, "codex_home": str(home)},
+                                   f"config.json5 account_options {name!r}"))
         else:
-            print(f"warning: skipping codex account '{acct['name']}' — no auth.json in "
-                  f"{home} (run: ./setup.sh add-codex-account {acct['name']})",
+            print(f"warning: skipping codex account '{name}' — no auth.json in "
+                  f"{home} (run: ./setup.py add-codex-account {name})",
                   file=sys.stderr)
-    cfg["codex_accounts"] = codex
+    devices = confidential.devices
     if not loaded and not codex:
-        raise SystemExit("no accounts with tokens configured — run: ./setup.sh add-account <name>")
-    # The example config ships a placeholder device key that is PUBLIC (it's in
-    # the repo). It must never be accepted as a live credential: refuse to start
-    # while one remains, so add-account-without-add-device can't open the proxy
-    # to anyone who read the example (GitHub issue #2).
-    bad = [d for d, k in (cfg.get("devices") or {}).items() if "REPLACE-WITH" in k]
+        raise SystemExit("no accounts with tokens configured — run: ./setup.py add-account <name>")
+    # The old example config shipped a placeholder device key that is PUBLIC (it's
+    # in the repo's history). It must never be accepted as a live credential:
+    # refuse to start while one remains, so a migrated install that never ran
+    # add-device can't open the proxy to anyone who read the example (GitHub issue #2).
+    bad = [d for d, k in devices.items() if "REPLACE-WITH" in k]
     if bad:
         raise SystemExit(
-            f"placeholder device key(s) in config.json: {', '.join(bad)} — the example "
+            f"placeholder device key(s) in confidential.json: {', '.join(bad)} — the example "
             "value is public and must never be a valid credential. "
-            "Run: ./setup.sh add-device <name> (it replaces the placeholder).")
-    return cfg
+            "Run: ./setup.py add-device <name> (it replaces the placeholder).")
+    if "alerts" in cfg:
+        cfg["alerts"] = from_json(Alerts_config, cfg["alerts"] or {}, "config.json5 alerts")
+    if "codex" in cfg:
+        cfg["codex"] = from_json(Codex_config, cfg["codex"] or {}, "config.json5 codex")
+    return from_json(Config, {**cfg, "accounts": loaded, "codex_accounts": codex,
+                              "devices": devices}, "config.json5")
 
 
 CFG = load_config()
-DEVICE_BY_KEY = {v: k for k, v in CFG["devices"].items()}
-ACCOUNTS = {a["name"]: a for a in CFG["accounts"]}
-THRESHOLD = CFG.get("switch_threshold", 0.8)
-THRESHOLD_7D = CFG.get("switch_threshold_7d", 0.98)
-STRATEGY = CFG.get("strategy", "consume-first")  # or "least-used"
-COOLDOWN_S = CFG.get("switch_cooldown_s", 300)
-SWITCH_MARGIN = CFG.get("switch_margin", 0.05)
-CF_MARGIN_S = CFG.get("consume_first_margin_s", 3600)
-HOLD_MAX_S = CFG.get("hold_max_s", 0)  # 0 = return 429 when every account is spent
-CODEX_ACCOUNTS = {a["name"]: a for a in CFG["codex_accounts"]}
-CODEX_CFG = CFG.get("codex", {})
+DEVICE_BY_KEY = {v: k for k, v in CFG.devices.items()}
+ACCOUNTS = {a.name: a for a in CFG.accounts}
+THRESHOLD = CFG.switch_threshold
+THRESHOLD_7D = CFG.switch_threshold_7d
+STRATEGY = CFG.strategy
+COOLDOWN_S = CFG.switch_cooldown_s
+SWITCH_MARGIN = CFG.switch_margin
+CF_MARGIN_S = CFG.consume_first_margin_s
+HOLD_MAX_S = CFG.hold_max_s
+CODEX_ACCOUNTS = {a.name: a for a in CFG.codex_accounts}
+CODEX_CFG = CFG.codex
 # Each image is a `codex exec` process (~40s); cap how many run at once.
-codex_slots = asyncio.Semaphore(CODEX_CFG.get("concurrency", 2))
+codex_slots = asyncio.Semaphore(CODEX_CFG.concurrency)
 
 
 def load_state() -> dict:
@@ -115,8 +223,8 @@ def load_state() -> dict:
         state = json.loads(STATE_PATH.read_text())
     else:
         state = {
-            "active_account": CFG["accounts"][0]["name"] if CFG["accounts"] else None,
-            "accounts": {a["name"]: {} for a in CFG["accounts"]},
+            "active_account": CFG.accounts[0].name if CFG.accounts else None,
+            "accounts": {a.name: {} for a in CFG.accounts},
             "events": [],
         }
     state.setdefault("codex", {})
@@ -158,11 +266,11 @@ def util_7d(name: str) -> float:
 
 def priority(name: str) -> int:
     """Lower = preferred. Accounts without a priority share the default tier."""
-    return ACCOUNTS[name].get("priority", 100)
+    return ACCOUNTS[name].priority
 
 
 def disabled(name: str) -> bool:
-    return bool(ACCOUNTS[name].get("disabled"))
+    return ACCOUNTS[name].disabled
 
 
 def usable(name: str) -> bool:
@@ -355,21 +463,9 @@ def device_from_request(request: Request) -> str | None:
     return DEVICE_BY_KEY.get(key)
 
 
-# API list prices per MTok (input, output), matched by substring of the model id.
-# Cost columns are *API-equivalent* dollars: what this usage would cost pay-per-token.
-# Override in config.json under "prices_per_mtok".
-PRICES = CFG.get("prices_per_mtok", {
-    "fable": [10.0, 50.0], "mythos": [10.0, 50.0],
-    "opus": [5.0, 25.0],
-    "sonnet": [3.0, 15.0],
-    "haiku": [1.0, 5.0],
-})
-DEFAULT_PRICE = [5.0, 25.0]
-ALERT_CFG = CFG.get("alerts", {
-    "device_tokens_per_hour": 5_000_000,
-    "expensive_model_patterns": ["opus", "fable", "mythos"],
-    "util_warn": 0.8,
-})
+PRICES = CFG.prices_per_mtok  # see DEFAULT_PRICES
+DEFAULT_PRICE = [5.0, 25.0]  # a model matching no pattern
+ALERT_CFG = CFG.alerts
 
 
 def price_for(model: str | None) -> list[float]:
@@ -486,26 +582,26 @@ def aggregate_audit() -> dict:
                 device_hour_tokens.get(rec.get("device", "?"), 0) + total)
             device_hour_reqs[dev] = device_hour_reqs.get(dev, 0) + 1
             model = rec.get("model") or ""
-            if any(p in model for p in ALERT_CFG["expensive_model_patterns"]):
+            if any(p in model for p in ALERT_CFG.expensive_model_patterns):
                 key = f'{rec.get("device", "?")} / {model}'
                 expensive_hour[key] = expensive_hour.get(key, 0) + 1
 
     alerts = []
     for dev, toks in device_hour_tokens.items():
-        if toks > ALERT_CFG["device_tokens_per_hour"]:
+        if toks > ALERT_CFG.device_tokens_per_hour:
             alerts.append({"level": "warn",
                            "text": f"{dev} consumed {toks:,} tokens in the last hour "
-                                   f"(threshold {ALERT_CFG['device_tokens_per_hour']:,})"})
+                                   f"(threshold {ALERT_CFG.device_tokens_per_hour:,})"})
     for key, n in expensive_hour.items():
         alerts.append({"level": "info", "text": f"expensive model in use: {key} — {n} requests in the last hour"})
     for name in ACCOUNTS:
         u = utilization(name)
-        if u >= ALERT_CFG["util_warn"]:
+        if u >= ALERT_CFG.util_warn:
             alerts.append({"level": "warn", "text": f"{name} 5h window at {u:.0%} (switch threshold {THRESHOLD:.0%})"})
 
     # Roster covers every registered device, traffic or not.
     devices = {}
-    for name, key in CFG["devices"].items():
+    for name, key in CFG.devices.items():
         meta = device_meta.get(name, {})
         last_ts = meta.get("last_ts")
         devices[name] = {
@@ -618,7 +714,7 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
     verdict = None
     while True:
         account = STATE["active_account"]
-        fwd_headers["authorization"] = f"Bearer {ACCOUNTS[account]['token']}"
+        fwd_headers["authorization"] = f"Bearer {ACCOUNTS[account].token}"
         pace = STATE["accounts"].get(account, {}).get("pace_until", 0) - time.time()
         if pace > 0:
             await asyncio.sleep(min(pace, 60))
@@ -761,7 +857,7 @@ async def openai_images(request: Request):
                                        "type": "authentication_error"}}, status_code=401)
     if not CODEX_ACCOUNTS:
         return JSONResponse({"error": {"message": "claude-rotate: no codex accounts "
-                                                  "configured (./setup.sh add-codex-account)",
+                                                  "configured (./setup.py add-codex-account)",
                                        "type": "invalid_request_error"}}, status_code=503)
     try:
         body = json.loads(await request.body())
@@ -780,16 +876,16 @@ async def openai_images(request: Request):
         result = await codex_image.generate(
             prompt, body.get("size"), accounts=CODEX_ACCOUNTS,
             state=STATE.setdefault("codex", {}), runner=codex_image.run_codex,
-            codex_bin=CODEX_CFG.get("bin", "codex"),
-            model=CODEX_CFG.get("model", "gpt-6.1-sol"),
-            effort=CODEX_CFG.get("reasoning_effort", "low"),
-            timeout_s=CODEX_CFG.get("timeout_s", 300),
+            codex_bin=CODEX_CFG.bin,
+            model=CODEX_CFG.model,
+            effort=CODEX_CFG.reasoning_effort,
+            timeout_s=CODEX_CFG.timeout_s,
             threshold=THRESHOLD, threshold_7d=THRESHOLD_7D)
     async with state_lock:
         save_state()
 
     rec = {"device": device, "account": result["account"], "path": "/v1/images/generations",
-           "model": CODEX_CFG.get("model", "gpt-6.1-sol"), "kind": "image",
+           "model": CODEX_CFG.model, "kind": "image",
            "elapsed_s": result["elapsed_s"]}
     if len(result["tried"]) > 1:
         rec["retries"] = len(result["tried"]) - 1
@@ -885,5 +981,5 @@ async def proxy(request: Request, path: str):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=CFG.get("bind", "127.0.0.1"), port=CFG.get("port", 8484),
+    uvicorn.run(app, host=CFG.bind, port=CFG.port,
                 log_level="warning")

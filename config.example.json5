@@ -1,0 +1,46 @@
+// claude-rotate settings. `./setup.py` copies this file to config.json5, which is yours to edit;
+// restart rotator.py after a change. Secrets - account tokens, device keys - are not here but in
+// confidential.json, which setup.py writes. JSON5: comments and trailing commas are allowed.
+// Every key is optional; a missing one takes the default shown here.
+{
+  "bind": "127.0.0.1",              // address to listen on: a LAN/VPN IP to serve other machines, 0.0.0.0 for all
+  "port": 8484,                     // TCP port
+  "public_url": "",                 // URL devices use, printed by add-device/onboard; "" = http://<this-host>:8484
+
+  "switch_threshold": 0.8,          // 5h-window utilization (0-1) at which the active account is rotated away from
+  "switch_threshold_7d": 0.98,      // weekly-window utilization (0-1) that makes an account unusable
+  "strategy": "consume-first",      // "consume-first": spend the account whose weekly window resets soonest; "least-used": lowest 5h utilization
+  "switch_cooldown_s": 300,         // min seconds between voluntary switches; a spent quota switches at once
+  "switch_margin": 0.05,            // hysteresis: a threshold switch needs a candidate this much less utilized
+  "consume_first_margin_s": 3600,   // consume-first switches proactively only to a weekly reset at least this much sooner
+  "hold_max_s": 0,                  // when every account is spent, hold a request up to this long for a reset; 0 = return 429
+
+  // Per-account options, by the account's name in confidential.json (Claude and Codex accounts alike):
+  //   "priority": lower = preferred tier (default 100); "disabled": true benches the account.
+  "account_options": {
+    // "acct-1": {"priority": 1},
+    // "acct-2": {"priority": 2, "disabled": false},
+  },
+
+  "prices_per_mtok": {              // the cost columns: API list $ per million tokens [input, output], by substring of the model id
+    "fable": [10.0, 50.0],          // (cache reads cost 0.1x input, cache writes 1.25x input)
+    "mythos": [10.0, 50.0],         // this table replaces the default one as a whole
+    "opus": [5.0, 25.0],
+    "sonnet": [3.0, 15.0],
+    "haiku": [1.0, 5.0],            // a model matching no pattern costs [5.0, 25.0]
+  },
+
+  "alerts": {                       // the panel's alerts; a key left out keeps its default
+    "device_tokens_per_hour": 5000000,                      // warn when one device uses more tokens than this in an hour
+    "expensive_model_patterns": ["opus", "fable", "mythos"], // note requests to models matching these
+    "util_warn": 0.8,                                       // warn when an account's 5h window reaches this utilization
+  },
+
+  "codex": {                        // image generation through the Codex CLI (`./setup.py add-codex-account`)
+    "bin": "codex",                 // the Codex CLI to run
+    "model": "gpt-6.1-sol",         // model for `codex exec`
+    "reasoning_effort": "low",      // its reasoning effort
+    "timeout_s": 300,               // per image
+    "concurrency": 2,               // images generated at once
+  },
+}
