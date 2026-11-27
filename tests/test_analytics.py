@@ -57,8 +57,8 @@ check("api_cost empty usage is 0", R.api_cost("claude-opus-5", {}) == 0.0)
 # --- aggregate_audit: rollups, window cut-off, alerts, roster ---
 tmp = Path(tempfile.mkdtemp())
 R.AUDIT_PATH = tmp / "audit.jsonl"
-R.CFG["devices"] = {"laptop": "key-laptop-abcd", "ci-box": "key-ci-efgh", "idle-dev": "key-idle-ijkl"}
-R.ACCOUNTS = {"a": {"name": "a"}, "b": {"name": "b"}}
+R.CFG.devices = {"laptop": "key-laptop-abcd", "ci-box": "key-ci-efgh", "idle-dev": "key-idle-ijkl"}
+R.ACCOUNTS = {"a": R.Account_config(name="a", token=""), "b": R.Account_config(name="b", token="")}
 R.STATE = {"active_account": "a", "events": [],
            "accounts": {"a": {"util_5h": 0.85, "reset_5h": time.time() + 3600}, "b": {}}}
 

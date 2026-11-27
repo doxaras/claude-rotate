@@ -50,14 +50,14 @@ def test_placeholder_device_key_refuses_startup():
 
 def test_real_keys_boot():
     cfg = _load_with({"accounts": ACCT, "devices": DEV})
-    assert cfg["accounts"] == [{"name": "a", "token": "sk-ant-oat01-test"}], cfg["accounts"]
-    assert cfg["devices"] == DEV
-    assert cfg["codex_accounts"] == []
+    assert cfg.accounts == [R.Account_config(name="a", token="sk-ant-oat01-test")], cfg.accounts
+    assert cfg.devices == DEV
+    assert cfg.codex_accounts == []
 
 
 def test_account_without_token_is_skipped_not_fatal():
     cfg = _load_with({"accounts": {**ACCT, "b": ""}, "devices": DEV})
-    assert [a["name"] for a in cfg["accounts"]] == ["a"]
+    assert [a.name for a in cfg.accounts] == ["a"]
 
 
 def test_settings_are_json5_with_comments_and_account_options():
@@ -68,15 +68,29 @@ def test_settings_are_json5_with_comments_and_account_options():
           strategy: 'least-used',   /* unquoted key, single quotes */
           "account_options": {"b": {"priority": 2, "disabled": true}},
         }""")
-    assert cfg["switch_threshold"] == 0.9 and cfg["strategy"] == "least-used"
-    by_name = {a["name"]: a for a in cfg["accounts"]}
-    assert by_name["b"] == {"name": "b", "token": "sk-ant-oat01-b", "priority": 2, "disabled": True}
-    assert by_name["a"] == {"name": "a", "token": "sk-ant-oat01-test"}
+    assert cfg.switch_threshold == 0.9 and cfg.strategy == "least-used"
+    by_name = {a.name: a for a in cfg.accounts}
+    assert by_name["b"] == R.Account_config(name="b", token="sk-ant-oat01-b", priority=2, disabled=True)
+    assert by_name["a"] == R.Account_config(name="a", token="sk-ant-oat01-test")
 
 
 def test_missing_settings_file_means_defaults():
     cfg = _load_with({"accounts": ACCT, "devices": DEV})
-    assert "switch_threshold" not in cfg  # rotator's CFG.get defaults apply
+    assert cfg == R.Config(accounts=cfg.accounts, codex_accounts=[], devices=DEV)
+    assert cfg.switch_threshold == 0.8 and cfg.alerts.util_warn == 0.8 and cfg.codex.concurrency == 2
+
+
+def test_unknown_settings_are_ignored_not_fatal():
+    cfg = _load_with({"accounts": ACCT, "devices": DEV}, """{
+        "switch_treshold": 0.5,  // misspelt
+        "alerts": {"util_warn": 0.7, "util_wran": 0.1},
+        "codex": {"concurrency": 4},
+        "account_options": {"a": {"priority": 3, "priorty": 1}},
+    }""")
+    assert cfg.switch_threshold == 0.8
+    assert cfg.alerts == R.Alerts_config(util_warn=0.7)
+    assert cfg.codex == R.Codex_config(concurrency=4)
+    assert cfg.accounts == [R.Account_config(name="a", token="sk-ant-oat01-test", priority=3)]
 
 
 def test_secrets_in_settings_are_refused():
