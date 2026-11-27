@@ -112,7 +112,7 @@ check("x-api-key stripped", seen["x-api-key"] is None)
 check("client anthropic-beta preserved", seen["beta"] == "oauth-2025-04-20")
 check("content-encoding dropped from response", "content-encoding" not in r.headers)
 check("state updated from unified headers",
-      R.STATE.accounts["a"]["util_5h"] == 0.5 and R.STATE.accounts["a"]["util_7d"] == 0.2)
+      R.STATE.accounts["a"].util_5h == 0.5 and R.STATE.accounts["a"].util_7d == 0.2)
 recs = audit_recs()
 check("audit written with usage + device + account",
       recs and recs[-1]["device"] == "laptop" and recs[-1]["account"] == "a"
@@ -163,7 +163,7 @@ check("SSE usage captured to audit",
 check("SSE audit records the 7d utilization too", recs[-1]["util_7d"] == "0.2")
 
 # --- 4. quota 429 → rotate → transparent retry -------------------------------
-fresh_state("a", {"b": {"util_5h": 0.1, "util_7d": 0.1}})
+fresh_state("a", {"b": R.Account(util_5h=0.1, util_7d=0.1)})
 calls = []
 
 
@@ -186,7 +186,7 @@ check("audit records final account + retry count",
       recs[-1]["account"] == "b" and recs[-1]["retries"] == 1 and recs[-1]["status"] == 200)
 
 # --- 5. burst 429 → pace same account, no rotation ---------------------------
-fresh_state("a", {"a": {"util_5h": 0.3, "util_7d": 0.1}, "b": {"util_5h": 0.0}})
+fresh_state("a", {"a": R.Account(util_5h=0.3, util_7d=0.1), "b": R.Account(util_5h=0.0)})
 calls = []
 
 
@@ -210,8 +210,8 @@ check("pace honored (~retry-after)", 0.9 <= elapsed < 5)
 
 # --- 6. every account spent, hold off → 429 passthrough ----------------------
 now = time.time()
-spent = {"a": {"util_5h": 1.0, "reset_5h": now + 100},
-         "b": {"util_5h": 1.0, "reset_5h": now + 2000}}
+spent = {"a": R.Account(util_5h=1.0, reset_5h=now + 100),
+         "b": R.Account(util_5h=1.0, reset_5h=now + 2000)}
 fresh_state("a", dict(spent))
 R.HOLD_MAX_S = 0
 # Pin the active account's reset as the soonest so pick_account's fallback
@@ -226,8 +226,8 @@ check("audit records the 429", audit_recs()[-1]["status"] == 429)
 
 # --- 7. every account spent, hold on → wait for reset, then succeed ----------
 now = time.time()
-fresh_state("a", {"a": {"util_5h": 1.0, "reset_5h": now + 100},
-                  "b": {"util_5h": 1.0, "reset_5h": now + 2000}})
+fresh_state("a", {"a": R.Account(util_5h=1.0, reset_5h=now + 100),
+                  "b": R.Account(util_5h=1.0, reset_5h=now + 2000)})
 R.HOLD_MAX_S = 2  # deadline caps the wait so the test stays fast
 calls = []
 
@@ -251,7 +251,7 @@ r = call()
 elapsed = time.time() - t0
 check("held request eventually succeeds", r.status_code == 200 and len(calls) == 2)
 check("hold waited for the deadline window", 1.5 <= elapsed < 10)
-check("hold event recorded", any(e["type"] == "hold" for e in R.STATE.events))
+check("hold event recorded", any(e.type == "hold" for e in R.STATE.events))
 R.HOLD_MAX_S = 0
 
 # --- 8. admin endpoints ------------------------------------------------------
