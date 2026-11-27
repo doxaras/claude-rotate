@@ -174,6 +174,19 @@ def weekly_reset(name: str) -> float:
     return STATE["accounts"].get(name, {}).get("reset_7d") or float("inf")
 
 
+def relief_ts(name: str, now: float) -> float:
+    """When this account is next usable: `now`, or the later of its blocking
+    windows' resets. A week-exhausted account isn't helped by a 5h reset; an
+    exhausted window with no known reset never clears (7d) or clears now (5h)."""
+    info = STATE["accounts"].get(name, {})
+    t = now
+    if utilization(name) >= THRESHOLD:
+        t = max(t, info.get("reset_5h") or now)
+    if util_7d(name) >= THRESHOLD_7D:
+        t = max(t, info.get("reset_7d") or float("inf"))
+    return t
+
+
 def earliest_relief() -> float:
     """Soonest moment any account's 5h window resets (for hold-until-reset)."""
     now = time.time()
@@ -190,7 +203,9 @@ def pick_account() -> str:
     consume-first (default): burn the usable account whose weekly window resets
     soonest — weekly quota is use-it-or-lose-it, so spend the perishable one.
     least-used: lowest 5h utilization.
-    If nothing is usable, the non-disabled account whose 5h window resets soonest.
+    If nothing is usable, the non-disabled account that becomes usable soonest
+    (relief_ts) -- never a week-exhausted account just because its 5h window
+    reset long ago.
     """
     under = [n for n in ACCOUNTS if usable(n)]
     if under:
@@ -198,7 +213,8 @@ def pick_account() -> str:
             return min(under, key=lambda n: (priority(n), weekly_reset(n), utilization(n)))
         return min(under, key=lambda n: (priority(n), utilization(n)))
     pool = [n for n in ACCOUNTS if not disabled(n)] or list(ACCOUNTS)
-    return min(pool, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
+    now = time.time()
+    return min(pool, key=lambda n: (relief_ts(n, now), priority(n)))
 
 
 async def note_response(account: str, headers: httpx.Headers, status: int) -> str | None:
