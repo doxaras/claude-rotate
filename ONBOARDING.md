@@ -27,7 +27,7 @@ On the server:
 
 ```bash
 cd /opt/claude-rotate            # or wherever it lives
-./setup.sh onboard maria laptop
+./setup.py onboard maria laptop
 ```
 
 This mints the key `maria-laptop`, restarts the service so it's live, and
