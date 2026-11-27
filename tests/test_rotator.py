@@ -193,4 +193,36 @@ R.STATE["accounts"] = {"a": {"util_5h": 1.0, "reset_5h": now + 10},
                        "c": {"util_5h": 1.0, "reset_5h": now + 50}}
 check("fallback skips disabled", R.pick_account() == "c")
 
+# 12. all-spent fallback ignores a stale 5h reset on a week-exhausted account (issue #3)
+R.ACCOUNTS = {"a": {"name": "a"}, "b": {"name": "b"}}
+fresh_state("b")
+R.STATE["accounts"] = {
+    "a": {"util_5h": 0.03, "reset_5h": now - 72000,       # 5h window reset long ago...
+          "util_7d": 1.0, "reset_7d": now + 260000},      # ...but the week is gone
+    "b": {"util_5h": 0.94, "reset_5h": now + 3600, "util_7d": 0.26, "reset_7d": now + 400000},
+}
+check("fallback skips week-exhausted account", R.pick_account() == "b")
+v = run(R.note_response("b", headers(u5=0.94, u7=0.26), 200))
+check("no threshold switch onto week-exhausted account", v is None and R.STATE["active_account"] == "b")
+R.STATE["active_account"] = "a"
+v = run(R.note_response("a", headers(u5=0.03, u7=1.0, status="rejected"), 429))
+check("quota 429 on week-exhausted account goes back", v == "switched" and R.STATE["active_account"] == "b")
+R.STATE["accounts"]["a"]["reset_7d"] = now - 10
+check("week-exhausted account eligible again after its 7d reset", R.pick_account() == "a")
+
+# 12b. both windows blocking: the later reset decides
+R.STATE["accounts"] = {
+    "a": {"util_5h": 1.0, "reset_5h": now + 100, "util_7d": 1.0, "reset_7d": now + 9000},
+    "b": {"util_5h": 1.0, "reset_5h": now + 5000, "util_7d": 0.5, "reset_7d": now + 400000},
+}
+check("relief is the later blocking reset", abs(R.relief_ts("a", now) - (now + 9000)) < 1)
+check("fallback picks soonest relief over soonest 5h reset", R.pick_account() == "b")
+check("earliest_relief ignores a 5h reset that won't free the account",
+      abs(R.earliest_relief() - (now + 5000)) < 5)
+R.ACCOUNTS["b"]["disabled"] = True
+check("earliest_relief skips disabled accounts", abs(R.earliest_relief() - (now + 9000)) < 5)
+R.STATE["accounts"]["a"].pop("reset_7d")
+check("earliest_relief falls back to 5 min with no known relief",
+      abs(R.earliest_relief() - (time.time() + 300)) < 5)
+
 print(f"\nall {PASS} checks passed")
