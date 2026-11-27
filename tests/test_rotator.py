@@ -141,6 +141,17 @@ fresh_state("a")
 R.STATE["accounts"] = {"a": {"util_5h": 1.0, "reset_5h": now - 10, "util_7d": 0.9, "reset_7d": now - 10}}
 check("passed 5h reset → util 0", R.utilization("a") == 0.0)
 check("passed 7d reset → util 0", R.util_7d("a") == 0.0)
+check("passed weekly reset rolls forward a week", R.weekly_reset("a") == now - 10 + R.WEEK_S)
+# 8b. a passed weekly reset doesn't draw a consume-first switch: its new
+# window resets a week later, not "already"
+fresh_state("b")
+R.STATE["accounts"] = {
+    "a": {"util_5h": 0.1, "util_7d": 0.99, "reset_7d": now - 1800},
+    "b": {"util_5h": 0.5, "util_7d": 0.6, "reset_7d": now + 4 * 86400},
+    "c": {"util_5h": 0.1, "util_7d": 0.1, "reset_7d": now + 6 * 86400},
+}
+v = run(R.note_response("b", headers(u5=0.5, u7=0.6), 200))
+check("no consume-first onto a passed weekly reset", v is None and R.STATE["active_account"] == "b")
 
 # 9. priority tiers: preferred tier always beats a sooner weekly reset
 R.ACCOUNTS = {"a": {"name": "a", "priority": 2},
