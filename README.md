@@ -708,8 +708,10 @@ commercial or shared, use the API with metered billing instead.
 ## For the next agent (continuation notes)
 
 Everything lives in **`rotator.py` (~450 lines, FastAPI)** — read it top to
-bottom before changing anything. `phase0_proxy.py` is a standalone logging
-passthrough kept for debugging header behavior; not part of the service.
+bottom before changing anything. The analytics panel's page is in `panel/`
+(`panel.html`, `panel.css`, `panel.js`), read per request — editing it needs
+no restart. `phase0_proxy.py` is a standalone logging passthrough kept for
+debugging header behavior; not part of the service.
 
 Load-bearing implementation facts (each was verified empirically — keep them):
 

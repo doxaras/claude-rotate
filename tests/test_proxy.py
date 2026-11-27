@@ -266,5 +266,13 @@ r = call(path="/rotate/stats", method="GET")
 check("stats returns rollups", r.status_code == 200 and "by_device" in r.json())
 r = call(path="/rotate/panel?key=devkey-1", key=None, method="GET")
 check("panel serves html", r.status_code == 200 and "text/html" in r.headers["content-type"])
+check("panel needs auth", call(path="/rotate/panel", key=None, method="GET").status_code == 401)
+r = call(path="/rotate/panel/panel.css", key=None, method="GET")
+check("panel css served", r.status_code == 200 and "text/css" in r.headers["content-type"])
+r = call(path="/rotate/panel/panel.js", key=None, method="GET")
+check("panel js served", r.status_code == 200 and "javascript" in r.headers["content-type"]
+      and "function refresh" in r.text)
+check("panel assets whitelisted", call(path="/rotate/panel/panel.html", key=None,
+                                       method="GET").status_code == 404)
 
 print(f"\nall {PASS} checks passed")
