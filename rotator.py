@@ -539,7 +539,7 @@ PANEL_HTML = """<!doctype html><html><head><meta charset="utf-8">
  td:first-child,th:first-child{text-align:left}
  .gauge{position:relative;display:inline-block;width:220px;height:12px;background:#2a2f38;border-radius:6px;overflow:hidden;vertical-align:middle;margin:0 .6rem}
  .gauge i{display:block;height:100%;background:#4caf7d} .gauge i.hot{background:#e0664d}
- .gauge em,.pace{display:inline-block;width:2px;background:#4dd0e1} .gauge em{position:absolute;top:0;bottom:0;margin-left:-1px}
+ .gauge em,.pace{display:inline-block;width:2px;background:#fff} .gauge em{position:absolute;top:0;bottom:0;margin-left:-1px}
  .pace{height:12px;vertical-align:middle;margin-right:.3rem}
  .active{color:#7dd87d;font-weight:600} .alert-warn{color:#ffb454} .alert-info{color:#9ecbff}
  .muted{color:#8a919c;font-size:.85rem}
@@ -562,7 +562,7 @@ function table(el, data){
     h+=`<tr><td>${k}</td><td>${v.requests}</td><td>${fmt(v.input_tokens)}</td><td>${fmt(v.output_tokens)}</td><td>${fmt(v.cache_read)}</td><td>${fmt(v.cache_write)}</td><td>$${v.cost_usd.toFixed(2)}</td></tr>`;
   el.innerHTML=h;
 }
-// A usage gauge; its cyan mark is the share of the window already elapsed,
+// A usage gauge; its white mark is the share of the window already elapsed,
 // i.e. where usage at a constant rate from the window's start to its reset
 // would stand now. No mark when the reset is unknown or already past.
 function gauge(used, reset, period_s, hot){
