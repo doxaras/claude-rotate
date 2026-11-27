@@ -51,7 +51,6 @@ ROOT = Path(__file__).parent
 CONFIDENTIAL_PATH = ROOT / "confidential.json"
 SETTINGS_PATH = ROOT / "config.json5"
 LEGACY_CONFIG_PATH = ROOT / "config.json"  # the single-file layout; ./setup.py migrate splits it
-CONFIDENTIAL_KEYS = ("accounts", "codex_accounts", "devices")
 STATE_PATH = ROOT / "state.json"
 AUDIT_PATH = ROOT / "logs" / "audit.jsonl"
 
@@ -75,8 +74,8 @@ T = TypeVar("T")
 
 def from_json(cls: type[T], data: dict, where: str) -> T:
     """Dataclass `cls` from its JSON object. A key it has no field for is
-    dropped with a warning: a misspelt config.json5 key, or a config.json5 or
-    state.json from another version, must not stop the proxy from starting."""
+    dropped with a warning: a misspelt config.json5 key, or a file from another
+    version, must not stop the proxy from starting."""
     known = {f.name for f in fields(cls)}
     unknown = sorted(set(data) - known)
     if unknown:
@@ -147,6 +146,15 @@ class Config:
     codex: Codex_config = field(default_factory=Codex_config)
 
 
+@dataclass(slots=True)
+class Confidential:
+    """confidential.json: the secrets, written only by setup.py. A section left
+    out, or null, is empty."""
+    accounts: dict[str, str] = field(default_factory=dict)  # Claude account name -> setup-token
+    codex_accounts: dict[str, str] = field(default_factory=dict)  # Codex account name -> CODEX_HOME
+    devices: dict[str, str] = field(default_factory=dict)  # device name -> device key
+
+
 def load_config() -> Config:
     """config.json5 and confidential.json as one Config. account_options are
     merged into the accounts they name."""
@@ -154,20 +162,22 @@ def load_config() -> Config:
         if LEGACY_CONFIG_PATH.exists():
             raise SystemExit("config.json is the old single-file layout — run: ./setup.py migrate")
         raise SystemExit("no confidential.json — run: ./setup.py, then add-account and add-device")
-    confidential = json.loads(CONFIDENTIAL_PATH.read_text())
+    data = json.loads(CONFIDENTIAL_PATH.read_text())
+    confidential = from_json(Confidential, {k: v for k, v in data.items() if v is not None},
+                             "confidential.json")
     cfg = json5.loads(SETTINGS_PATH.read_text()) if SETTINGS_PATH.exists() else {}
-    misplaced = [k for k in CONFIDENTIAL_KEYS if k in cfg]
+    misplaced = [f.name for f in fields(Confidential) if f.name in cfg]
     if misplaced:
         raise SystemExit(f"config.json5 has {', '.join(misplaced)} — those live in "
                          "confidential.json (written by ./setup.py); per-account settings go "
                          "under account_options")
     options = cfg.pop("account_options", None) or {}
-    unknown = set(options) - set(confidential.get("accounts") or {}) - set(confidential.get("codex_accounts") or {})
+    unknown = set(options) - set(confidential.accounts) - set(confidential.codex_accounts)
     if unknown:
         print(f"warning: account_options for unknown account(s): {', '.join(sorted(unknown))}",
               file=sys.stderr)
     loaded = []
-    for name, token in (confidential.get("accounts") or {}).items():
+    for name, token in confidential.accounts.items():
         if isinstance(token, str) and token.strip():
             loaded.append(from_json(Account_config,
                                     {**options.get(name, {}), "name": name, "token": token.strip()},
@@ -176,7 +186,7 @@ def load_config() -> Config:
             print(f"warning: skipping account '{name}' — no token in confidential.json "
                   f"(run: ./setup.py add-account {name})", file=sys.stderr)
     codex = []
-    for name, codex_home in (confidential.get("codex_accounts") or {}).items():
+    for name, codex_home in confidential.codex_accounts.items():
         home = Path(codex_home).expanduser()
         if not home.is_absolute():
             home = ROOT / home
@@ -188,7 +198,7 @@ def load_config() -> Config:
             print(f"warning: skipping codex account '{name}' — no auth.json in "
                   f"{home} (run: ./setup.py add-codex-account {name})",
                   file=sys.stderr)
-    devices = confidential.get("devices") or {}
+    devices = confidential.devices
     if not loaded and not codex:
         raise SystemExit("no accounts with tokens configured — run: ./setup.py add-account <name>")
     # The old example config shipped a placeholder device key that is PUBLIC (it's
