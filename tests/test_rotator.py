@@ -217,5 +217,12 @@ R.STATE["accounts"] = {
 }
 check("relief is the later blocking reset", abs(R.relief_ts("a", now) - (now + 9000)) < 1)
 check("fallback picks soonest relief over soonest 5h reset", R.pick_account() == "b")
+check("earliest_relief ignores a 5h reset that won't free the account",
+      abs(R.earliest_relief() - (now + 5000)) < 5)
+R.ACCOUNTS["b"]["disabled"] = True
+check("earliest_relief skips disabled accounts", abs(R.earliest_relief() - (now + 9000)) < 5)
+R.STATE["accounts"]["a"].pop("reset_7d")
+check("earliest_relief falls back to 5 min with no known relief",
+      abs(R.earliest_relief() - (time.time() + 300)) < 5)
 
 print(f"\nall {PASS} checks passed")

@@ -188,11 +188,13 @@ def relief_ts(name: str, now: float) -> float:
 
 
 def earliest_relief() -> float:
-    """Soonest moment any account's 5h window resets (for hold-until-reset)."""
+    """Soonest moment any non-disabled account becomes usable again (relief_ts),
+    for hold-until-reset and Retry-After; 5 minutes out if no account has a
+    known reset ahead."""
     now = time.time()
-    resets = [i.get("reset_5h") for i in STATE["accounts"].values()
-              if i.get("reset_5h") and i["reset_5h"] > now]
-    return min(resets) if resets else now + 300
+    pool = [n for n in ACCOUNTS if not disabled(n)] or list(ACCOUNTS)
+    reliefs = [t for t in (relief_ts(n, now) for n in pool) if now < t < float("inf")]
+    return min(reliefs) if reliefs else now + 300
 
 
 def pick_account() -> str:
