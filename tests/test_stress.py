@@ -103,7 +103,7 @@ check("throughput sane (>50 req/s via ASGI+mock)", 300 / secs > 50,
 # issue #1). What the lock DOES guarantee, and what these checks pin: one
 # switch decision (no switch stampede), and every request retries exactly once
 # onto the survivor — no retry thrash, no second herd.
-fresh_state("a", {"b": {"util_5h": 0.1, "util_7d": 0.1}})
+fresh_state("a", {"b": R.Account(util_5h=0.1, util_7d=0.1)})
 upstream_calls = {"a": 0, "b": 0}
 
 
@@ -119,7 +119,7 @@ async def race_handler(req):
 
 use_upstream(race_handler)
 resps, secs = blast(100)
-switches = [e for e in R.STATE.events if e["type"] == "switch"]
+switches = [e for e in R.STATE.events if e.type == "switch"]
 check("100 in-flight during quota hit: all recover to 200",
       all(r.status_code == 200 for r in resps))
 check("exactly one switch event despite 100 racers", len(switches) == 1,
@@ -133,7 +133,7 @@ check("audit final records all on b",
       all(rec["account"] == "b" for rec in audit_recs()))
 
 # --- 3. burst storm: 429 bursts pace, never rotate ---------------------------
-fresh_state("a", {"a": {"util_5h": 0.3, "util_7d": 0.1}, "b": {"util_5h": 0.0}})
+fresh_state("a", {"a": R.Account(util_5h=0.3, util_7d=0.1), "b": R.Account(util_5h=0.0)})
 burst_count = {"n": 0}
 
 
@@ -150,13 +150,13 @@ resps, secs = blast(100)
 check("burst storm: all requests recover to 200",
       all(r.status_code == 200 for r in resps))
 check("burst storm: zero rotations",
-      not any(e["type"] == "switch" for e in R.STATE.events)
+      not any(e.type == "switch" for e in R.STATE.events)
       and R.STATE.active_account == "a")
 
 # --- 4. concurrent holds: everyone parks, everyone finishes ------------------
 now = time.time()
-fresh_state("a", {"a": {"util_5h": 1.0, "reset_5h": now + 100},
-                  "b": {"util_5h": 1.0, "reset_5h": now + 2000}})
+fresh_state("a", {"a": R.Account(util_5h=1.0, reset_5h=now + 100),
+                  "b": R.Account(util_5h=1.0, reset_5h=now + 2000)})
 R.HOLD_MAX_S = 2
 hold_count = {"n": 0}
 
@@ -177,7 +177,7 @@ resps, secs = blast(20)
 check("20 concurrent held requests all finish 200",
       all(r.status_code == 200 for r in resps))
 check("held ~deadline then released together", 1.5 <= secs < 20, f"{secs:.1f}s")
-check("hold events recorded", any(e["type"] == "hold" for e in R.STATE.events))
+check("hold events recorded", any(e.type == "hold" for e in R.STATE.events))
 R.HOLD_MAX_S = 0
 
 # --- 5. parallel SSE streams relay byte-identical ----------------------------
@@ -196,7 +196,7 @@ check("50 parallel SSE streams byte-identical",
 check("SSE audit complete under concurrency", len(audit_recs()) == 50)
 
 # --- 6. events list stays bounded under switch churn -------------------------
-fresh_state("a", {"a": {"util_5h": 0.1}, "b": {"util_5h": 0.1}})
+fresh_state("a", {"a": R.Account(util_5h=0.1), "b": R.Account(util_5h=0.1)})
 R.COOLDOWN_S = 0
 
 
