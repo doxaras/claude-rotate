@@ -20,7 +20,9 @@ in two files next to this script, split by who writes them:
 Every subcommand migrates an old config.json first. add-account reads the token
 from the terminal with echo off, or from stdin when stdin is not a terminal (e.g.
 piped over ssh). Reading config.json5 (public_url) needs the json5 package from
-requirements.txt; everything else is standard library.
+requirements.txt; everything else is standard library. When a .venv sits next to
+this script, ./setup.py re-runs itself under .venv/bin/python, so the
+`#!/usr/bin/env python3` line cannot pick a system python that lacks json5.
 """
 import argparse
 import getpass
@@ -305,6 +307,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def use_venv() -> None:
+    """Re-exec under ROOT/.venv/bin/python when that exists and is not the
+    interpreter already running: requirements.txt is installed there, while
+    `env python3` may find a system python without json5."""
+    venv = ROOT / ".venv"
+    venv_python = venv / "bin" / "python"
+    if venv_python.exists() and Path(sys.prefix).resolve() != venv.resolve():
+        os.execv(venv_python, [str(venv_python), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     os.chdir(ROOT)
@@ -313,4 +325,5 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
+    use_venv()
     sys.exit(main(sys.argv[1:]))
