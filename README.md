@@ -94,19 +94,23 @@ not Anthropic latency.
 
 ## Quickstart (server)
 
-Requires Python 3.10+ and three packages: `fastapi`, `httpx`, `uvicorn`
-(pinned in `requirements.txt`). Any always-on box works — a Mac mini, a
+Requires Python 3.10+ and four packages: `fastapi`, `httpx`, `uvicorn`,
+`json5` (pinned in `requirements.txt`). Any always-on box works — a Mac mini, a
 home-lab Linux machine, a small VPS.
 
 ```bash
 git clone <this repo> && cd claude-rotate
 pip install -r requirements.txt
-./setup.sh                      # creates config.json, tokens/, logs/
-./setup.sh add-account acct-1   # paste token from: claude setup-token  (account 1's browser)
-./setup.sh add-account acct-2   # …account 2
-./setup.sh add-device my-laptop # prints the env vars for that device
+./setup.py                      # creates confidential.json, config.json5, logs/
+./setup.py add-account acct-1   # paste token from: claude setup-token  (account 1's browser)
+./setup.py add-account acct-2   # …account 2
+./setup.py add-device my-laptop # prints the env vars for that device
 python3 rotator.py
 ```
+
+Upgrading an install that still has a single `config.json`? `./setup.py migrate`
+(or any `setup.py` command) splits it into the two files — see
+[Configuration](#configuration-confidentialjson--configjson5).
 
 ## Generating account tokens (`claude setup-token`)
 
@@ -124,8 +128,8 @@ claude setup-token
   local callback (headless server, SSH session), it falls back to a paste-a-code
   flow — so you can mint tokens on the proxy server itself.
 - Prints a token starting `sk-ant-oat01-…` to the terminal and does **not**
-  save it anywhere — copy it straight into `./setup.sh add-account <name>`,
-  which stores it under `tokens/` (chmod 600, gitignored).
+  save it anywhere — copy it straight into `./setup.py add-account <name>`,
+  which stores it in `confidential.json` (chmod 600, gitignored).
 - Valid for **about one year**. Requires a Claude subscription (Pro, Max,
   Team, or Enterprise).
 
@@ -199,7 +203,7 @@ export ANTHROPIC_BASE_URL=http://192.168.1.42:8484
   Macs, iPhones, and most Linux devices (with `avahi-daemon`) — no IP to
   remember. Otherwise give the server a **DHCP reservation** in your router so
   its IP never changes under the devices pointing at it.
-- Set `bind` in `config.json` to the LAN IP (or keep `0.0.0.0` if the box has
+- Set `bind` in `config.json5` to the LAN IP (or keep `0.0.0.0` if the box has
   only one network). Verify from a device: `curl http://<server>:8484/rotate/status?key=<device key>`.
 - **Do not port-forward 8484 on your router.** LAN-only means the firewall
   boundary is your router's NAT; forwarding the port turns this into the
@@ -231,10 +235,11 @@ export CLAUDE_CODE_OAUTH_TOKEN=<device key>
 ```
 
 Tighten the listener so the proxy is *only* reachable over the tailnet — set
-`bind` in `config.json` to the server's Tailscale IP instead of `0.0.0.0`:
+`bind` in `config.json5` to the server's Tailscale IP instead of `0.0.0.0`:
 
-```json
-{ "bind": "100.x.y.z", "port": 8484 }
+```json5
+"bind": "100.x.y.z",  // the server's Tailscale IP
+"port": 8484,
 ```
 
 Optional TLS: `tailscale serve --bg http://127.0.0.1:8484` publishes the proxy
@@ -289,7 +294,7 @@ world and your Anthropic tokens is the device-key check. If you go this
 route, put [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/)
 (a Zero Trust service-token policy) in front so unauthenticated requests never
 reach the proxy, and treat device keys as revocable: delete a leaked one from
-`config.json` and restart. Prefer any of the VPN options above when possible.
+`confidential.json` and restart. Prefer any of the VPN options above when possible.
 
 ### Other overlays
 
@@ -315,7 +320,7 @@ rate-limit headers:
 - **Accounts** — live 5-hour and weekly utilization gauges (from Anthropic's
   own headers), active account, reset countdowns.
 - **Alerts** — device over N tokens/hour, expensive-model usage (Opus/Fable),
-  account near the switch threshold. Thresholds in `config.json`.
+  account near the switch threshold. Thresholds in `config.json5`.
 - **Consumption (24h)** — by device / model / account, with a *cost-equivalent*
   column: what the usage would cost at API list prices (incl. cache read 0.1× /
   write 1.25×) — i.e. what the subscriptions are saving you.
@@ -350,7 +355,7 @@ OpenAI-style as `b64_json`:
 
 ```bash
 npm i -g @openai/codex
-./setup.sh add-codex-account plus-1     # device-code login into codex/plus-1
+./setup.py add-codex-account plus-1     # device-code login into codex/plus-1
 curl -s http://my-server:8484/v1/images/generations \
   -H "Authorization: Bearer $DEVICE_KEY" -H "Content-Type: application/json" \
   -d '{"prompt": "a data centre at dusk", "size": "1536x1024"}'
@@ -374,22 +379,48 @@ curl -s http://my-server:8484/v1/images/generations \
 - **Codex-only instances** are fine: with `codex_accounts` and no Claude
   `accounts`, the Claude routes answer 503.
 
-```json
-"codex_accounts": [{"name": "plus-1", "codex_home": "codex/plus-1"}],
+`add-codex-account` records the account in `confidential.json`
+(`"codex_accounts": {"plus-1": "codex/plus-1"}`, name → `CODEX_HOME`); the CLI
+settings are in `config.json5`:
+
+```json5
 "codex": {"bin": "codex", "model": "gpt-6.1-sol", "reasoning_effort": "low",
-          "timeout_s": 300, "concurrency": 2}
+          "timeout_s": 300, "concurrency": 2},
 ```
 
 The same terms caveat as above applies: these are consumer plans.
 
-## Configuration (`config.json`)
+## Configuration (`confidential.json` + `config.json5`)
 
-| Field | Meaning |
+Two files, split by who writes them:
+
+- **`confidential.json`** — the secrets, written by `setup.py` (chmod 600,
+  gitignored). Edit it by hand only to revoke something.
+
+  | Field | Meaning |
+  |---|---|
+  | `accounts{}` | `name → setup-token` — one `claude setup-token` per subscription (`./setup.py add-account`) |
+  | `codex_accounts{}` | `name → CODEX_HOME` of a ChatGPT-plan login (`./setup.py add-codex-account`) |
+  | `devices{}` | `name → device key`; key is what the device puts in `CLAUDE_CODE_OAUTH_TOKEN` (`./setup.py add-device`) |
+
+- **`config.json5`** — the settings, yours to edit; `./setup.py` creates it
+  from [`config.example.json5`](config.example.json5), which explains every
+  key on its own line. [JSON5](https://json5.org): comments and trailing
+  commas are allowed. Every key is optional. Restart after a change.
+
+`./setup.py migrate` turns an old single-file `config.json` into the two: the
+tokens are read from their `token_file`s, an account's `priority`/`disabled`
+move to `account_options`, and `config.json` is renamed `config.json.migrated`
+(delete it and `tokens/` once the proxy runs). Every other `setup.py` command
+migrates first too; `rotator.py` refuses to start on the old layout.
+
+| `config.json5` field | Meaning |
 |---|---|
-| `accounts[]` | `{name, token_file}` — one `claude setup-token` per subscription, stored under `tokens/` (chmod 600) |
-| `devices{}` | `name → device key`; key is what the device puts in `CLAUDE_CODE_OAUTH_TOKEN` |
-| `accounts[].priority` | lower = preferred; accounts form tiers, backup tiers only used when every preferred account is spent (default 100) |
-| `accounts[].disabled` | `true` benches an account: never rotated onto, still shown in the panel |
+| `account_options{}` | `name → {priority, disabled}` for an account in `confidential.json` (Claude or Codex) |
+| `account_options.<name>.priority` | lower = preferred; accounts form tiers, backup tiers only used when every preferred account is spent (default 100) |
+| `account_options.<name>.disabled` | `true` benches an account: never rotated onto, still shown in the panel |
+| `bind`, `port` | where the proxy listens (default `127.0.0.1`, `8484`) |
+| `public_url` | the URL `add-device`/`onboard` print for devices |
 | `switch_threshold` | 5h-window utilization that triggers rotation (default 0.8) |
 | `switch_threshold_7d` | weekly-window utilization that makes an account unusable (default 0.98) |
 | `strategy` | `consume-first` (default) or `least-used` — see below |
@@ -398,7 +429,8 @@ The same terms caveat as above applies: these are consumer plans.
 | `consume_first_margin_s` | proactive switch only if the candidate's weekly reset is this much sooner (default 3600) |
 | `hold_max_s` | when *every* account is spent, hold the request open up to this long waiting for a window reset instead of returning 429 (default 0 = off) |
 | `prices_per_mtok` | substring-matched `[input, output]` $ per MTok for the cost columns |
-| `alerts` | `device_tokens_per_hour`, `expensive_model_patterns`, `util_warn` |
+| `alerts` | `device_tokens_per_hour`, `expensive_model_patterns`, `util_warn` (each optional) |
+| `codex` | the Codex CLI's `bin`, `model`, `reasoning_effort`, `timeout_s`, `concurrency` |
 
 ### Rotation policy
 
@@ -427,7 +459,7 @@ weekly window under `switch_threshold_7d`; a window past its reset counts as
 
 ### Preferring one account over another
 
-Three levels of control, from lazy to pro — all in the same `config.json`,
+Three levels of control, from lazy to pro — all in the same `config.json5`,
 deliberately **no separate rules file** (see design note below):
 
 **Level 0 — do nothing.** The defaults (consume-first + thresholds + cooldown)
@@ -435,12 +467,12 @@ already make a sane global decision. Most single-owner setups need nothing else.
 
 **Level 1 — priority tiers.** Give accounts a `priority` (lower = preferred):
 
-```json
-"accounts": [
-  { "name": "max-20x",  "token_file": "tokens/max-20x.token",  "priority": 1 },
-  { "name": "max-5x",   "token_file": "tokens/max-5x.token",   "priority": 1 },
-  { "name": "old-pro",  "token_file": "tokens/old-pro.token",  "priority": 2 }
-]
+```json5
+"account_options": {
+  "max-20x": {"priority": 1},
+  "max-5x":  {"priority": 1},
+  "old-pro": {"priority": 2},  // backup tier
+},
 ```
 
 Rotation happens *within* the lowest-numbered tier that still has a usable
@@ -478,14 +510,14 @@ config objects, not as a DSL.
 **Client gets 401 with `claude-rotate: unknown device key`.** The proxy is
 rejecting the *device* (the error body names claude-rotate, so it's not
 Anthropic). The device's `CLAUDE_CODE_OAUTH_TOKEN` doesn't match any entry in
-`config.json` `devices{}` — re-check the key, or re-run
-`./setup.sh add-device` and restart.
+`confidential.json` `devices{}` — re-check the key, or re-run
+`./setup.py add-device` and restart.
 
 **Client gets a 401 whose error body comes from Anthropic.** The *account
 token* the proxy swapped in was rejected upstream — on a previously working
 account this almost always means the setup token died (revoked, or hit its
-~1-year expiry). Re-mint with `claude setup-token`, replace
-`tokens/<name>.token`, restart.
+~1-year expiry). Re-mint with `claude setup-token`, store it with
+`./setup.py add-account <name>` (it replaces the old one), restart.
 
 **A request seems to hang.** If every account is spent and `hold_max_s` is
 set, that's hold-until-reset doing its job — the request is parked until the
@@ -555,8 +587,8 @@ Stated plainly, in the same spirit as the [comparison](#comparison-with-similar-
 
   No restart needed (the file is opened per write). In-process rotation is on
   the roadmap.
-- **What to back up.** `tokens/` and `config.json` — that's the whole
-  identity of the install. `state.json` is disposable (quota state is
+- **What to back up.** `confidential.json` and `config.json5` (plus `codex/`
+  for image accounts) — that's the whole identity of the install. `state.json` is disposable (quota state is
   re-learned from the first responses; you only lose the events history), and
   `logs/` is disposable analytics.
 - **Upgrades.** `git pull`, run `python3 tests/run_all.py`, restart the
@@ -631,11 +663,13 @@ commercial or shared, use the API with metered billing instead.
 
 ## Security notes
 
-- `tokens/*.token` are year-long bearer credentials for your Anthropic
-  accounts. They stay on the server, mode 600, and are gitignored along with
-  `config.json`, `state.json`, and `logs/`.
+- The account tokens in `confidential.json` are year-long bearer credentials
+  for your Anthropic accounts. The file stays on the server, mode 600, and is
+  gitignored along with `config.json5`, `state.json`, and `logs/`. Keeping the
+  secrets out of `config.json5` means the settings can be shown, diffed or
+  synced to the server without them.
 - Device keys authenticate devices to the proxy only; revoke one by deleting
-  its entry in `config.json` and restarting.
+  its entry in `confidential.json` and restarting.
 - Don't expose port 8484 to the public internet; bind to a tailnet/LAN
   interface or keep `bind: 0.0.0.0` behind a firewall.
 
@@ -668,7 +702,7 @@ Load-bearing implementation facts (each was verified empirically — keep them):
 Roadmap, in intended order:
 
 - [x] **Tests.** `python3 tests/run_all.py` — 101 offline checks, no network
-      (needs a valid `config.json` to import the module):
+      (needs a valid `confidential.json` to import the module):
       `test_rotator.py` switch logic (consume-first ordering, burst-vs-quota
       429, cooldown, hysteresis, hold/exhausted verdicts, window-reset
       recovery); `test_analytics.py` SSE usage capture, pricing/cost math,
