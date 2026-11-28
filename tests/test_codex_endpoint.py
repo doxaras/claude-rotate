@@ -35,12 +35,12 @@ tmp = Path(tempfile.mkdtemp())
 R.AUDIT_PATH = tmp / "audit.jsonl"
 R.save_state = lambda: None
 R.DEVICE_BY_KEY = {"devkey-1": "aimedia"}
-R.CFG["devices"] = {"aimedia": "devkey-1"}
+R.CFG.devices = {"aimedia": "devkey-1"}
 R.THRESHOLD, R.THRESHOLD_7D = 0.8, 0.98
 for n in ("p1", "p2"):
     (tmp / n).mkdir()
-R.CODEX_ACCOUNTS = {"p1": {"name": "p1", "codex_home": str(tmp / "p1"), "priority": 1},
-                    "p2": {"name": "p2", "codex_home": str(tmp / "p2"), "priority": 2}}
+R.CODEX_ACCOUNTS = {n: R.codex_image.Codex_account_config(name=n, codex_home=str(tmp / n), priority=p)
+                    for n, p in (("p1", 1), ("p2", 2))}
 MODE = {}
 
 
@@ -67,7 +67,7 @@ def call(path, key="devkey-1", body=None, method="POST"):
 
 
 def reset():
-    R.STATE = {"active_account": None, "accounts": {}, "events": [], "codex": {}}
+    R.STATE = R.State()
     R.AUDIT_PATH.write_text("")
 
 

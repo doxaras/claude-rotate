@@ -22,6 +22,7 @@ import json
 import os
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -29,6 +30,44 @@ from typing import Awaitable, Callable
 Runner = Callable[..., Awaitable[tuple[int, str]]]
 
 AUTH_BACKOFF_S = 1800  # a signed-out account sits out this long before a retry
+
+
+@dataclass(slots=True)
+class Codex_account_config:
+    """A Codex account: its CODEX_HOME (from confidential.json) and its
+    account_options (from config.json5)."""
+    name: str
+    codex_home: str
+    priority: int = 100  # lower = preferred tier
+    disabled: bool = False
+    switch_threshold: float | None = None  # None = the global switch_threshold
+    switch_threshold_7d: float | None = None  # None = the global switch_threshold_7d
+
+
+def account_threshold(account: Codex_account_config, default: float) -> float:
+    """The 5h utilization at which this account stops being used: its own
+    switch_threshold, else `default` (the global one)."""
+    return default if account.switch_threshold is None else account.switch_threshold
+
+
+def account_threshold_7d(account: Codex_account_config, default: float) -> float:
+    """The weekly utilization at which this account stops being used: its own
+    switch_threshold_7d, else `default` (the global one)."""
+    return default if account.switch_threshold_7d is None else account.switch_threshold_7d
+
+
+@dataclass(slots=True)
+class Codex_account:
+    """What is known about one Codex account's quota (from its session logs) and
+    login; the proxy persists these in state.json under "codex". A fresh account
+    has the defaults: nothing used, no known reset, not benched."""
+    util_5h: float = 0.0
+    util_7d: float = 0.0
+    reset_5h: float | None = None  # epoch seconds
+    reset_7d: float | None = None
+    last_seen: float | None = None
+    benched_until: float = 0.0  # a signed-out account sits out until then
+    last_error: str | None = None
 
 
 def aspect_for(size: str | None) -> str:
@@ -110,19 +149,26 @@ def read_session(codex_home: Path, thread_id: str) -> str:
     return hits[0].read_text(errors="replace") if hits else ""
 
 
-def usable(name: str, accounts: dict, state: dict, threshold: float,
+def usable(name: str, accounts: dict[str, Codex_account_config],
+           state: dict[str, Codex_account], threshold: float,
            threshold_7d: float, now: float) -> bool:
-    if accounts[name].get("disabled"):
+    """Not disabled, not benched, and both windows under the account's
+    thresholds; `threshold` / `threshold_7d` are the global ones, used where
+    the account has none of its own."""
+    account = accounts[name]
+    if account.disabled:
         return False
-    info = state.get(name, {})
-    if info.get("benched_until", 0) > now:
+    info = state.get(name, Codex_account())
+    if info.benched_until > now:
         return False
-    u5 = 0.0 if info.get("reset_5h", 0) and now >= info["reset_5h"] else info.get("util_5h", 0.0)
-    u7 = 0.0 if info.get("reset_7d", 0) and now >= info["reset_7d"] else info.get("util_7d", 0.0)
-    return u5 < threshold and u7 < threshold_7d
+    u5 = 0.0 if info.reset_5h and now >= info.reset_5h else info.util_5h
+    u7 = 0.0 if info.reset_7d and now >= info.reset_7d else info.util_7d
+    return (u5 < account_threshold(account, threshold)
+            and u7 < account_threshold_7d(account, threshold_7d))
 
 
-def pick_codex_account(accounts: dict, state: dict, threshold: float,
+def pick_codex_account(accounts: dict[str, Codex_account_config],
+                       state: dict[str, Codex_account], threshold: float,
                        threshold_7d: float, now: float,
                        exclude: set[str] = frozenset()) -> str | None:
     """Same policy as the Claude side: priority tier first, then consume-first
@@ -131,9 +177,9 @@ def pick_codex_account(accounts: dict, state: dict, threshold: float,
              and usable(n, accounts, state, threshold, threshold_7d, now)]
     if not under:
         return None
-    return min(under, key=lambda n: (accounts[n].get("priority", 100),
-                                     state.get(n, {}).get("reset_7d") or float("inf"),
-                                     state.get(n, {}).get("util_5h", 0.0)))
+    return min(under, key=lambda n: (accounts[n].priority,
+                                     state.get(n, Codex_account()).reset_7d or float("inf"),
+                                     state.get(n, Codex_account()).util_5h))
 
 
 async def run_codex(codex_bin: str, codex_home: Path, model: str, effort: str,
@@ -155,7 +201,9 @@ async def run_codex(codex_bin: str, codex_home: Path, model: str, effort: str,
     return proc.returncode or 0, out.decode(errors="replace")
 
 
-async def generate(prompt: str, size: str | None, *, accounts: dict, state: dict,
+async def generate(prompt: str, size: str | None, *,
+                   accounts: dict[str, Codex_account_config],
+                   state: dict[str, Codex_account],
                    codex_bin: str = "codex", model: str = "gpt-6.1-sol",
                    effort: str = "low", timeout_s: float = 300,
                    threshold: float = 0.8, threshold_7d: float = 0.98,
@@ -174,33 +222,35 @@ async def generate(prompt: str, size: str | None, *, accounts: dict, state: dict
         if name is None:
             break
         tried.append(name)
-        home = Path(accounts[name]["codex_home"]).expanduser()
+        home = Path(accounts[name].codex_home).expanduser()
         rc, output = await runner(codex_bin, home, model, effort,
                                   build_prompt(prompt, size), timeout_s)
-        info = state.setdefault(name, {})
-        info["last_seen"] = time.time()
+        info = state.setdefault(name, Codex_account())
+        info.last_seen = time.time()
         tid = thread_id_from(output)
         if tid:
-            info.update(parse_rate_limits(read_session(home, tid)))
+            for key, value in parse_rate_limits(read_session(home, tid)).items():
+                setattr(info, key, value)
             png = find_image(home, tid)
             if png is not None:
-                info.pop("benched_until", None)
+                info.benched_until = 0.0
                 return {"ok": True, "account": name, "png": png.read_bytes(),
                         "elapsed_s": round(time.time() - started, 1), "tried": tried}
         kind = classify_failure(output)
         last_error = output.strip().splitlines()[-1][:300] if output.strip() else f"exit {rc}"
         if kind == "quota":
-            info["util_5h"] = max(info.get("util_5h", 0.0), 1.0)
-            info.setdefault("reset_5h", time.time() + 3600)
+            info.util_5h = max(info.util_5h, 1.0)
+            if info.reset_5h is None:
+                info.reset_5h = time.time() + 3600
             continue
         if kind == "auth":
-            info["benched_until"] = time.time() + AUTH_BACKOFF_S
-            info["last_error"] = last_error
+            info.benched_until = time.time() + AUTH_BACKOFF_S
+            info.last_error = last_error
             continue
         return {"ok": False, "account": name, "error": last_error, "tried": tried,
                 "elapsed_s": round(time.time() - started, 1)}
 
-    resets = [state.get(n, {}).get("reset_5h", 0) for n in accounts]
+    resets = [state.get(n, Codex_account()).reset_5h or 0 for n in accounts]
     future = [r for r in resets if r > time.time()]
     retry_after = max(1, round(min(future) - time.time())) if future else 300
     return {"ok": False, "account": None, "error": last_error, "tried": tried,

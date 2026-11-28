@@ -32,17 +32,16 @@ def check(name, cond):
 tmp = Path(tempfile.mkdtemp())
 R.AUDIT_PATH = tmp / "audit.jsonl"
 R.save_state = lambda: None
-R.ACCOUNTS = {"a": {"name": "a", "token": "tok-a"}, "b": {"name": "b", "token": "tok-b"}}
+R.ACCOUNTS = {"a": R.Account_config(name="a", token="tok-a"), "b": R.Account_config(name="b", token="tok-b")}
 R.DEVICE_BY_KEY = {"devkey-1": "laptop"}
-R.CFG["devices"] = {"laptop": "devkey-1"}
+R.CFG.devices = {"laptop": "devkey-1"}
 R.THRESHOLD, R.THRESHOLD_7D = 0.8, 0.98
 R.STRATEGY, R.COOLDOWN_S, R.SWITCH_MARGIN, R.CF_MARGIN_S = "consume-first", 300, 0.05, 3600
 R.HOLD_MAX_S = 0
 
 
 def fresh_state(active="a", accounts=None):
-    R.STATE = {"active_account": active, "accounts": accounts or {}, "events": [],
-               "last_switch_ts": 0}
+    R.STATE = R.State(active_account=active, accounts=accounts or {})
     R.AUDIT_PATH.write_text("")
 
 
@@ -104,7 +103,8 @@ def ok_handler(req):
 
 
 use_upstream(ok_handler)
-r = call(headers={"x-api-key": "should-be-dropped", "anthropic-beta": "oauth-2025-04-20"})
+r = call(headers={"x-api-key": "should-be-dropped", "anthropic-beta": "oauth-2025-04-20",
+                  "x-claude-code-session-id": "session-1"})
 check("success passes through", r.status_code == 200)
 check("device key swapped for account token", seen["auth"] == "Bearer tok-a")
 check("accept-encoding forced to identity", seen["accept-encoding"] == "identity")
@@ -112,11 +112,37 @@ check("x-api-key stripped", seen["x-api-key"] is None)
 check("client anthropic-beta preserved", seen["beta"] == "oauth-2025-04-20")
 check("content-encoding dropped from response", "content-encoding" not in r.headers)
 check("state updated from unified headers",
-      R.STATE["accounts"]["a"]["util_5h"] == 0.5 and R.STATE["accounts"]["a"]["util_7d"] == 0.2)
+      R.STATE.accounts["a"].util_5h == 0.5 and R.STATE.accounts["a"].util_7d == 0.2)
 recs = audit_recs()
 check("audit written with usage + device + account",
       recs and recs[-1]["device"] == "laptop" and recs[-1]["account"] == "a"
       and recs[-1]["usage"]["input_tokens"] == 7 and recs[-1]["model"] == "claude-opus-5")
+check("audit records Claude Code's session id", recs[-1].get("session_id") == "session-1")
+check("audit records both windows' utilization, resets and status",
+      recs[-1]["util_5h"] == "0.5" and recs[-1]["util_7d"] == "0.2"
+      and float(recs[-1]["reset_5h"]) > time.time() and float(recs[-1]["reset_7d"]) > time.time()
+      and recs[-1]["ratelimit_status"] == "allowed")
+
+# --- 2b. device key in x-rotate-device-key, the client's own login as bearer --
+fresh_state()
+seen.clear()
+
+
+def header_handler(req):
+    seen["auth"] = req.headers.get("authorization")
+    seen["device-header"] = req.headers.get("x-rotate-device-key")
+    return httpx.Response(200, json={"usage": {"input_tokens": 1, "output_tokens": 1}},
+                          headers=unified())
+
+
+use_upstream(header_handler)
+r = call(key="sk-ant-oat01-the-clients-own-login", headers={"x-rotate-device-key": "devkey-1"})
+check("device key header authenticates despite a foreign bearer", r.status_code == 200)
+check("client's own login swapped for account token", seen["auth"] == "Bearer tok-a")
+check("device key header not forwarded upstream", seen["device-header"] is None)
+check("audit names the header's device", audit_recs()[-1]["device"] == "laptop")
+check("unknown device key header → 401 even with a known bearer",
+      call(headers={"x-rotate-device-key": "wrong-key"}).status_code == 401)
 
 # --- 3. SSE relay ------------------------------------------------------------
 fresh_state()
@@ -134,9 +160,10 @@ check("SSE usage captured to audit",
       recs and recs[-1]["usage"] == {"input_tokens": 11, "output_tokens": 33,
                                      "cache_read_input_tokens": 0,
                                      "cache_creation_input_tokens": 0})
+check("SSE audit records the 7d utilization too", recs[-1]["util_7d"] == "0.2")
 
 # --- 4. quota 429 → rotate → transparent retry -------------------------------
-fresh_state("a", {"b": {"util_5h": 0.1, "util_7d": 0.1}})
+fresh_state("a", {"b": R.Account(util_5h=0.1, util_7d=0.1)})
 calls = []
 
 
@@ -153,13 +180,13 @@ use_upstream(quota_handler)
 r = call()
 check("quota 429 hidden from client, retry succeeds", r.status_code == 200)
 check("retry rode the next account", calls == ["Bearer tok-a", "Bearer tok-b"])
-check("active account rotated", R.STATE["active_account"] == "b")
+check("active account rotated", R.STATE.active_account == "b")
 recs = audit_recs()
 check("audit records final account + retry count",
       recs[-1]["account"] == "b" and recs[-1]["retries"] == 1 and recs[-1]["status"] == 200)
 
 # --- 5. burst 429 → pace same account, no rotation ---------------------------
-fresh_state("a", {"a": {"util_5h": 0.3, "util_7d": 0.1}, "b": {"util_5h": 0.0}})
+fresh_state("a", {"a": R.Account(util_5h=0.3, util_7d=0.1), "b": R.Account(util_5h=0.0)})
 calls = []
 
 
@@ -178,13 +205,13 @@ r = call()
 elapsed = time.time() - t0
 check("burst 429 hidden from client", r.status_code == 200)
 check("burst retried on the SAME account", calls == ["Bearer tok-a", "Bearer tok-a"])
-check("no rotation on burst", R.STATE["active_account"] == "a")
+check("no rotation on burst", R.STATE.active_account == "a")
 check("pace honored (~retry-after)", 0.9 <= elapsed < 5)
 
 # --- 6. every account spent, hold off → 429 passthrough ----------------------
 now = time.time()
-spent = {"a": {"util_5h": 1.0, "reset_5h": now + 100},
-         "b": {"util_5h": 1.0, "reset_5h": now + 2000}}
+spent = {"a": R.Account(util_5h=1.0, reset_5h=now + 100),
+         "b": R.Account(util_5h=1.0, reset_5h=now + 2000)}
 fresh_state("a", dict(spent))
 R.HOLD_MAX_S = 0
 # Pin the active account's reset as the soonest so pick_account's fallback
@@ -199,8 +226,8 @@ check("audit records the 429", audit_recs()[-1]["status"] == 429)
 
 # --- 7. every account spent, hold on → wait for reset, then succeed ----------
 now = time.time()
-fresh_state("a", {"a": {"util_5h": 1.0, "reset_5h": now + 100},
-                  "b": {"util_5h": 1.0, "reset_5h": now + 2000}})
+fresh_state("a", {"a": R.Account(util_5h=1.0, reset_5h=now + 100),
+                  "b": R.Account(util_5h=1.0, reset_5h=now + 2000)})
 R.HOLD_MAX_S = 2  # deadline caps the wait so the test stays fast
 calls = []
 
@@ -224,7 +251,7 @@ r = call()
 elapsed = time.time() - t0
 check("held request eventually succeeds", r.status_code == 200 and len(calls) == 2)
 check("hold waited for the deadline window", 1.5 <= elapsed < 10)
-check("hold event recorded", any(e["type"] == "hold" for e in R.STATE["events"]))
+check("hold event recorded", any(e.type == "hold" for e in R.STATE.events))
 R.HOLD_MAX_S = 0
 
 # --- 8. admin endpoints ------------------------------------------------------
@@ -239,5 +266,13 @@ r = call(path="/rotate/stats", method="GET")
 check("stats returns rollups", r.status_code == 200 and "by_device" in r.json())
 r = call(path="/rotate/panel?key=devkey-1", key=None, method="GET")
 check("panel serves html", r.status_code == 200 and "text/html" in r.headers["content-type"])
+check("panel needs auth", call(path="/rotate/panel", key=None, method="GET").status_code == 401)
+r = call(path="/rotate/panel/panel.css", key=None, method="GET")
+check("panel css served", r.status_code == 200 and "text/css" in r.headers["content-type"])
+r = call(path="/rotate/panel/panel.js", key=None, method="GET")
+check("panel js served", r.status_code == 200 and "javascript" in r.headers["content-type"]
+      and "function refresh" in r.text)
+check("panel assets whitelisted", call(path="/rotate/panel/panel.html", key=None,
+                                       method="GET").status_code == 404)
 
 print(f"\nall {PASS} checks passed")

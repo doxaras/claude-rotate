@@ -58,7 +58,7 @@ def _accounts(tmp: Path, *names: str) -> dict:
     out = {}
     for n in names:
         (tmp / n).mkdir()
-        out[n] = {"name": n, "codex_home": str(tmp / n)}
+        out[n] = ci.Codex_account_config(name=n, codex_home=str(tmp / n))
     return out
 
 
@@ -90,16 +90,35 @@ def test_classify_failure():
 
 def test_pick_priority_then_consume_first():
     now = time.time()
-    accts = {"a": {}, "b": {}, "c": {"priority": 1}, "d": {"disabled": True}}
-    state = {"a": {"reset_7d": now + 900_000}, "b": {"reset_7d": now + 100_000},
-             "c": {"util_5h": 0.95, "reset_5h": now + 60}}
+    accts = {n: ci.Codex_account_config(name=n, codex_home="") for n in "abcd"}
+    accts["c"].priority = 1
+    accts["d"].disabled = True
+    state = {"a": ci.Codex_account(reset_7d=now + 900_000),
+             "b": ci.Codex_account(reset_7d=now + 100_000),
+             "c": ci.Codex_account(util_5h=0.95, reset_5h=now + 60)}
     # c is preferred but over threshold, d disabled -> b (weekly resets sooner)
     assert ci.pick_codex_account(accts, state, 0.8, 0.98, now) == "b"
     # c's 5h window has passed its reset -> counts as 0 again, preferred tier wins
-    state["c"]["reset_5h"] = now - 1
+    state["c"].reset_5h = now - 1
     assert ci.pick_codex_account(accts, state, 0.8, 0.98, now) == "c"
-    state["a"]["benched_until"] = now + 60
+    state["a"].benched_until = now + 60
     assert ci.pick_codex_account(accts, state, 0.8, 0.98, now, exclude={"b", "c"}) is None
+
+
+def test_per_account_thresholds():
+    now = time.time()
+    accts = {n: ci.Codex_account_config(name=n, codex_home="") for n in "abc"}
+    accts["a"].switch_threshold = 0.5
+    accts["b"].switch_threshold_7d = 0.7
+    accts["c"].switch_threshold = 0.9
+    state = {"a": ci.Codex_account(util_5h=0.6),
+             "b": ci.Codex_account(util_7d=0.75),
+             "c": ci.Codex_account(util_5h=0.85)}
+    # a and b are past their own thresholds; c is past the global 0.8 but not its own 0.9
+    assert [n for n in accts if ci.usable(n, accts, state, 0.8, 0.98, now)] == ["c"]
+    assert ci.pick_codex_account(accts, state, 0.8, 0.98, now) == "c"
+    assert ci.account_threshold(accts["b"], 0.8) == 0.8
+    assert ci.account_threshold_7d(accts["b"], 0.98) == 0.7
 
 
 def test_generate_success_records_telemetry():
@@ -110,7 +129,7 @@ def test_generate_success_records_telemetry():
         res = asyncio.run(ci.generate("hero", "1536x1024", accounts=accts,
                                       state=state, runner=runner))
         assert res["ok"] and res["png"] == PNG and res["account"] == "plus-1"
-        assert state["plus-1"]["util_5h"] == 0.12 and state["plus-1"]["util_7d"] == 0.03
+        assert state["plus-1"].util_5h == 0.12 and state["plus-1"].util_7d == 0.03
         assert "16:9 landscape" in calls[0][1]
         assert ci.to_openai(res)["data"][0]["b64_json"]
 
@@ -118,15 +137,15 @@ def test_generate_success_records_telemetry():
 def test_generate_rotates_on_quota_and_auth():
     with tempfile.TemporaryDirectory() as d:
         accts = _accounts(Path(d), "a", "b", "c")
-        accts["a"]["priority"] = 1
-        accts["b"]["priority"] = 2
+        accts["a"].priority = 1
+        accts["b"].priority = 2
         runner, calls = _fake_runner({"a": "quota", "b": "auth", "c": "ok"})
         state: dict = {}
         res = asyncio.run(ci.generate("hero", None, accounts=accts,
                                       state=state, runner=runner))
         assert res["ok"] and res["account"] == "c" and res["tried"] == ["a", "b", "c"]
-        assert state["a"]["util_5h"] >= 1.0            # spent: skipped next time
-        assert state["b"]["benched_until"] > time.time()  # signed out: benched
+        assert state["a"].util_5h >= 1.0            # spent: skipped next time
+        assert state["b"].benched_until > time.time()  # signed out: benched
         # next call goes straight to c
         res2 = asyncio.run(ci.generate("hero", None, accounts=accts,
                                        state=state, runner=runner))

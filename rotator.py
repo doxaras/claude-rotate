@@ -3,7 +3,10 @@
 Devices point at this proxy and authenticate with an internal device key:
 
     export ANTHROPIC_BASE_URL=http://my-server:8484   # over tailscale
-    export CLAUDE_CODE_OAUTH_TOKEN=<device key from config.json>
+    export CLAUDE_CODE_OAUTH_TOKEN=<device key from confidential.json>
+
+(or, to keep the device's own claude.ai login, ANTHROPIC_CUSTOM_HEADERS=
+"X-Rotate-Device-Key: <device key>" instead of CLAUDE_CODE_OAUTH_TOKEN).
 
 Per request, the proxy:
   1. maps the device key -> device name (401 if unknown),
@@ -19,7 +22,8 @@ Per request, the proxy:
   7. optionally holds a request open until the soonest window reset when every
      account is spent (hold_max_s), so unattended runs finish on their own.
 
-GET /rotate/status (device-key auth) returns live state for the admin page.
+GET /rotate/status (device-key auth) returns live state for the admin page;
+GET /rotate/panel serves that page, whose HTML, CSS and JS live in panel/.
 """
 
 import asyncio
@@ -28,25 +32,38 @@ import os
 import sys
 import time
 from collections import deque
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+from typing import ClassVar, TypeVar
 
 import httpx
+import json5
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 import codex_image
+from confidential import CONFIDENTIAL_SECTIONS, read_confidential
 from oai_compat import SseToOai, anthropic_to_oai, oai_to_anthropic
 
 ROOT = Path(__file__).parent
-CONFIG_PATH = ROOT / "config.json"
+# Two files, split by who writes them: confidential.json holds the secrets and is
+# written by setup.py (account tokens, codex homes, device keys); config.json5 holds
+# the settings and is edited by hand (JSON5, so it can carry comments).
+CONFIDENTIAL_PATH = ROOT / "confidential.json"
+SETTINGS_PATH = ROOT / "config.json5"
+LEGACY_CONFIG_PATH = ROOT / "config.json"  # the single-file layout; ./setup.py migrate splits it
 STATE_PATH = ROOT / "state.json"
 AUDIT_PATH = ROOT / "logs" / "audit.jsonl"
 
 UPSTREAM = "https://api.anthropic.com"
+# Alternative to sending the device key as the bearer token; see device_from_request.
+DEVICE_KEY_HEADER = "x-rotate-device-key"
+SESSION_HEADER = "x-claude-code-session-id"  # logged as the audit record's session_id
 HOP = {
     "host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "content-length", "accept-encoding",
+    DEVICE_KEY_HEADER,  # the device key never goes upstream
 }
 
 app = FastAPI()
@@ -54,73 +71,237 @@ client = httpx.AsyncClient(base_url=UPSTREAM, timeout=httpx.Timeout(600.0, conne
 state_lock = asyncio.Lock()
 
 
-def load_config() -> dict:
-    cfg = json.loads(CONFIG_PATH.read_text())
+T = TypeVar("T")
+
+
+def from_json(cls: type[T], data: dict, where: str) -> T:
+    """Dataclass `cls` from its JSON object. A key it has no field for is
+    dropped with a warning: a misspelt config.json5 key, or a file from another
+    version, must not stop the proxy from starting."""
+    known = {f.name for f in fields(cls)}
+    unknown = sorted(set(data) - known)
+    if unknown:
+        print(f"warning: ignoring unknown key(s) in {where}: {', '.join(unknown)}",
+              file=sys.stderr)
+    return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass(slots=True)
+class Account_config:
+    """A Claude account: its setup-token from confidential.json and its
+    account_options from config.json5."""
+    name: str
+    token: str
+    priority: int = 100  # lower = preferred tier
+    disabled: bool = False  # benched: never picked, left at once when active
+    switch_threshold: float | None = None  # None = the global switch_threshold
+    switch_threshold_7d: float | None = None  # None = the global switch_threshold_7d
+
+
+@dataclass(slots=True)
+class Alerts_config:
+    """config.json5's "alerts": when the panel warns."""
+    device_tokens_per_hour: int = 5_000_000  # one device's tokens in the last hour
+    expensive_model_patterns: list[str] = field(
+        default_factory=lambda: ["opus", "fable", "mythos"])  # model id substrings
+    util_warn: float = 0.8  # an account's 5h utilization
+
+
+@dataclass(slots=True)
+class Codex_config:
+    """config.json5's "codex": image generation through the Codex CLI."""
+    bin: str = "codex"
+    model: str = "gpt-6.1-sol"
+    reasoning_effort: str = "low"
+    timeout_s: float = 300  # per image
+    concurrency: int = 2  # images generated at once
+
+
+# API list prices per MTok (input, output), matched by substring of the model id.
+# Cost columns are *API-equivalent* dollars: what this usage would cost pay-per-token.
+# config.json5's "prices_per_mtok" replaces this table as a whole.
+DEFAULT_PRICES = {
+    "fable": [10.0, 50.0], "mythos": [10.0, 50.0],
+    "opus": [5.0, 25.0],
+    "sonnet": [3.0, 15.0],
+    "haiku": [1.0, 5.0],
+}
+
+
+@dataclass(slots=True)
+class Config:
+    """The settings from config.json5, every one optional, with the accounts and
+    devices from confidential.json. config.example.json5 documents the settings."""
+    accounts: list[Account_config]  # only those with a token
+    codex_accounts: list[codex_image.Codex_account_config]  # only those signed in
+    devices: dict[str, str]  # device name -> device key
+    bind: str = "127.0.0.1"
+    port: int = 8484
+    public_url: str = ""  # read by setup.py
+    switch_threshold: float = 0.8
+    switch_threshold_7d: float = 0.98
+    strategy: str = "consume-first"  # or "least-used"
+    switch_cooldown_s: float = 300
+    switch_margin: float = 0.05
+    consume_first_margin_s: float = 3600
+    hold_max_s: float = 0  # 0 = return 429 when every account is spent
+    prices_per_mtok: dict[str, list[float]] = field(default_factory=lambda: dict(DEFAULT_PRICES))
+    alerts: Alerts_config = field(default_factory=Alerts_config)
+    codex: Codex_config = field(default_factory=Codex_config)
+
+
+def load_config() -> Config:
+    """config.json5 and confidential.json as one Config. account_options are
+    merged into the accounts they name."""
+    if not CONFIDENTIAL_PATH.exists():
+        if LEGACY_CONFIG_PATH.exists():
+            raise SystemExit("config.json is the old single-file layout — run: ./setup.py migrate")
+        raise SystemExit("no confidential.json — run: ./setup.py, then add-account and add-device")
+    confidential = read_confidential(CONFIDENTIAL_PATH)
+    cfg = json5.loads(SETTINGS_PATH.read_text()) if SETTINGS_PATH.exists() else {}
+    misplaced = [k for k in CONFIDENTIAL_SECTIONS if k in cfg]
+    if misplaced:
+        raise SystemExit(f"config.json5 has {', '.join(misplaced)} — those live in "
+                         "confidential.json (written by ./setup.py); per-account settings go "
+                         "under account_options")
+    options = cfg.pop("account_options", None) or {}
+    unknown = set(options) - set(confidential.accounts) - set(confidential.codex_accounts)
+    if unknown:
+        print(f"warning: account_options for unknown account(s): {', '.join(sorted(unknown))}",
+              file=sys.stderr)
     loaded = []
-    for acct in cfg["accounts"]:
-        path = ROOT / acct["token_file"]
-        if path.exists():
-            acct["token"] = path.read_text().strip()
-            loaded.append(acct)
+    for name, token in confidential.accounts.items():
+        if isinstance(token, str) and token.strip():
+            loaded.append(from_json(Account_config,
+                                    {**options.get(name, {}), "name": name, "token": token.strip()},
+                                    f"config.json5 account_options {name!r}"))
         else:
-            print(f"warning: skipping account '{acct['name']}' — {acct['token_file']} not found",
-                  file=sys.stderr)
-    cfg["accounts"] = loaded
+            print(f"warning: skipping account '{name}' — no token in confidential.json "
+                  f"(run: ./setup.py add-account {name})", file=sys.stderr)
     codex = []
-    for acct in cfg.get("codex_accounts") or []:
-        home = Path(acct["codex_home"]).expanduser()
+    for name, codex_home in confidential.codex_accounts.items():
+        home = Path(codex_home).expanduser()
         if not home.is_absolute():
             home = ROOT / home
         if (home / "auth.json").exists():
-            acct["codex_home"] = str(home)
-            codex.append(acct)
+            codex.append(from_json(codex_image.Codex_account_config,
+                                   {**options.get(name, {}), "name": name, "codex_home": str(home)},
+                                   f"config.json5 account_options {name!r}"))
         else:
-            print(f"warning: skipping codex account '{acct['name']}' — no auth.json in "
-                  f"{home} (run: ./setup.sh add-codex-account {acct['name']})",
+            print(f"warning: skipping codex account '{name}' — no auth.json in "
+                  f"{home} (run: ./setup.py add-codex-account {name})",
                   file=sys.stderr)
-    cfg["codex_accounts"] = codex
+    devices = confidential.devices
     if not loaded and not codex:
-        raise SystemExit("no accounts with tokens configured — run: ./setup.sh add-account <name>")
-    # The example config ships a placeholder device key that is PUBLIC (it's in
-    # the repo). It must never be accepted as a live credential: refuse to start
-    # while one remains, so add-account-without-add-device can't open the proxy
-    # to anyone who read the example (GitHub issue #2).
-    bad = [d for d, k in (cfg.get("devices") or {}).items() if "REPLACE-WITH" in k]
+        raise SystemExit("no accounts with tokens configured — run: ./setup.py add-account <name>")
+    # The old example config shipped a placeholder device key that is PUBLIC (it's
+    # in the repo's history). It must never be accepted as a live credential:
+    # refuse to start while one remains, so a migrated install that never ran
+    # add-device can't open the proxy to anyone who read the example (GitHub issue #2).
+    bad = [d for d, k in devices.items() if "REPLACE-WITH" in k]
     if bad:
         raise SystemExit(
-            f"placeholder device key(s) in config.json: {', '.join(bad)} — the example "
+            f"placeholder device key(s) in confidential.json: {', '.join(bad)} — the example "
             "value is public and must never be a valid credential. "
-            "Run: ./setup.sh add-device <name> (it replaces the placeholder).")
-    return cfg
+            "Run: ./setup.py add-device <name> (it replaces the placeholder).")
+    if "alerts" in cfg:
+        cfg["alerts"] = from_json(Alerts_config, cfg["alerts"] or {}, "config.json5 alerts")
+    if "codex" in cfg:
+        cfg["codex"] = from_json(Codex_config, cfg["codex"] or {}, "config.json5 codex")
+    return from_json(Config, {**cfg, "accounts": loaded, "codex_accounts": codex,
+                              "devices": devices}, "config.json5")
 
 
 CFG = load_config()
-DEVICE_BY_KEY = {v: k for k, v in CFG["devices"].items()}
-ACCOUNTS = {a["name"]: a for a in CFG["accounts"]}
-THRESHOLD = CFG.get("switch_threshold", 0.8)
-THRESHOLD_7D = CFG.get("switch_threshold_7d", 0.98)
-STRATEGY = CFG.get("strategy", "consume-first")  # or "least-used"
-COOLDOWN_S = CFG.get("switch_cooldown_s", 300)
-SWITCH_MARGIN = CFG.get("switch_margin", 0.05)
-CF_MARGIN_S = CFG.get("consume_first_margin_s", 3600)
-HOLD_MAX_S = CFG.get("hold_max_s", 0)  # 0 = return 429 when every account is spent
-CODEX_ACCOUNTS = {a["name"]: a for a in CFG["codex_accounts"]}
-CODEX_CFG = CFG.get("codex", {})
+DEVICE_BY_KEY = {v: k for k, v in CFG.devices.items()}
+ACCOUNTS = {a.name: a for a in CFG.accounts}
+THRESHOLD = CFG.switch_threshold
+THRESHOLD_7D = CFG.switch_threshold_7d
+STRATEGY = CFG.strategy
+COOLDOWN_S = CFG.switch_cooldown_s
+SWITCH_MARGIN = CFG.switch_margin
+CF_MARGIN_S = CFG.consume_first_margin_s
+HOLD_MAX_S = CFG.hold_max_s
+CODEX_ACCOUNTS = {a.name: a for a in CFG.codex_accounts}
+CODEX_CFG = CFG.codex
 # Each image is a `codex exec` process (~40s); cap how many run at once.
-codex_slots = asyncio.Semaphore(CODEX_CFG.get("concurrency", 2))
+codex_slots = asyncio.Semaphore(CODEX_CFG.concurrency)
 
 
-def load_state() -> dict:
-    if STATE_PATH.exists():
-        state = json.loads(STATE_PATH.read_text())
-    else:
-        state = {
-            "active_account": CFG["accounts"][0]["name"] if CFG["accounts"] else None,
-            "accounts": {a["name"]: {} for a in CFG["accounts"]},
-            "events": [],
-        }
-    state.setdefault("codex", {})
-    return state
+@dataclass(slots=True)
+class Account:
+    """What a Claude account's last replies said (the anthropic-ratelimit-unified-*
+    headers). An account with no reply yet has the defaults: nothing used, no
+    known reset."""
+    util_5h: float = 0.0
+    util_7d: float = 0.0
+    reset_5h: float | None = None  # epoch seconds
+    reset_7d: float | None = None
+    status: str | None = None  # "allowed", "rejected", ...
+    last_seen: float | None = None
+    pace_until: float = 0.0  # a per-minute burst 429 holds requests back until then
+
+
+@dataclass(slots=True)
+class Event:
+    """One switch or hold, for /rotate/status. In JSON the two accounts are
+    "from" and "to" (`from` is a Python keyword)."""
+    ts: str
+    type: str  # "switch" or "hold"
+    from_account: str
+    to_account: str
+    reason: str
+    util: float | None = None  # a switch: the 5h utilization of the account it left
+
+    JSON_KEYS: ClassVar[dict[str, str]] = {"from_account": "from", "to_account": "to"}
+
+    @classmethod
+    def from_json(cls, data: dict) -> "Event":
+        field_names = {v: k for k, v in cls.JSON_KEYS.items()}
+        return from_json(cls, {field_names.get(k, k): v for k, v in data.items()},
+                         "a state.json event")
+
+    def to_json(self) -> dict:
+        return {self.JSON_KEYS.get(k, k): v for k, v in asdict(self).items()}
+
+
+@dataclass(slots=True)
+class State:
+    """What the proxy keeps across restarts; persisted as state.json."""
+    active_account: str | None = None
+    accounts: dict[str, Account] = field(default_factory=dict)
+    events: list[Event] = field(default_factory=list)  # newest last, the last 200 kept
+    last_switch_ts: float = 0
+    codex: dict[str, codex_image.Codex_account] = field(default_factory=dict)
+
+    @classmethod
+    def from_json(cls, data: dict) -> "State":
+        state = from_json(cls, data, "state.json")
+        state.accounts = {name: from_json(Account, info, f"state.json account {name!r}")
+                          for name, info in state.accounts.items()}
+        events = []
+        for event in state.events:
+            try:
+                events.append(Event.from_json(event))
+            except TypeError as e:  # a required field missing
+                print(f"warning: dropping a state.json event ({e}): {event}", file=sys.stderr)
+        state.events = events
+        state.codex = {name: from_json(codex_image.Codex_account, info,
+                                       f"state.json codex account {name!r}")
+                       for name, info in state.codex.items()}
+        return state
+
+    def to_json(self) -> dict:
+        data = asdict(self)
+        data["events"] = [e.to_json() for e in self.events]
+        return data
+
+
+def load_state() -> State:
+    if not STATE_PATH.exists():
+        return State(active_account=CFG.accounts[0].name if CFG.accounts else None,
+                     accounts={a.name: Account() for a in CFG.accounts})
+    return State.from_json(json.loads(STATE_PATH.read_text()))
 
 
 STATE = load_state()
@@ -130,7 +311,7 @@ def save_state() -> None:
     # Write-then-rename so a crash mid-write can never leave a truncated
     # state.json (which would refuse to parse on the next start).
     tmp = STATE_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(STATE, indent=2))
+    tmp.write_text(json.dumps(STATE.to_json(), indent=2))
     tmp.replace(STATE_PATH)
 
 
@@ -141,45 +322,88 @@ def audit(rec: dict) -> None:
 
 
 def utilization(name: str) -> float:
-    info = STATE["accounts"].get(name, {})
+    info = STATE.accounts.get(name, Account())
     now = time.time()
     # A window that has reset no longer counts against the account.
-    if info.get("reset_5h") and now >= info["reset_5h"]:
+    if info.reset_5h and now >= info.reset_5h:
         return 0.0
-    return info.get("util_5h", 0.0)
+    return info.util_5h
 
 
 def util_7d(name: str) -> float:
-    info = STATE["accounts"].get(name, {})
-    if info.get("reset_7d") and time.time() >= info["reset_7d"]:
+    info = STATE.accounts.get(name, Account())
+    if info.reset_7d and time.time() >= info.reset_7d:
         return 0.0
-    return info.get("util_7d", 0.0)
+    return info.util_7d
 
 
 def priority(name: str) -> int:
     """Lower = preferred. Accounts without a priority share the default tier."""
-    return ACCOUNTS[name].get("priority", 100)
+    return ACCOUNTS[name].priority
 
 
 def disabled(name: str) -> bool:
-    return bool(ACCOUNTS[name].get("disabled"))
+    return ACCOUNTS[name].disabled
+
+
+def threshold(name: str) -> float:
+    """The 5h utilization at which this account is left: its own
+    switch_threshold from account_options, else the global one."""
+    own = ACCOUNTS[name].switch_threshold
+    return THRESHOLD if own is None else own
+
+
+def threshold_7d(name: str) -> float:
+    """The weekly utilization that makes this account unusable: its own
+    switch_threshold_7d from account_options, else the global one."""
+    own = ACCOUNTS[name].switch_threshold_7d
+    return THRESHOLD_7D if own is None else own
 
 
 def usable(name: str) -> bool:
     return (not disabled(name)
-            and utilization(name) < THRESHOLD and util_7d(name) < THRESHOLD_7D)
+            and utilization(name) < threshold(name) and util_7d(name) < threshold_7d(name))
+
+
+WEEK_S = 7 * 24 * 3600
 
 
 def weekly_reset(name: str) -> float:
-    return STATE["accounts"].get(name, {}).get("reset_7d") or float("inf")
+    """The account's next weekly reset. A stored reset that has already passed
+    is rolled forward by whole weeks: the new window's reset is only learned
+    from the account's next reply, and until then the stale value would look
+    like the soonest reset of all and draw a consume-first switch onto an
+    account whose week has just started."""
+    reset = STATE.accounts.get(name, Account()).reset_7d
+    if not reset:
+        return float("inf")
+    now = time.time()
+    if reset <= now:
+        reset += ((now - reset) // WEEK_S + 1) * WEEK_S
+    return reset
+
+
+def relief_ts(name: str, now: float) -> float:
+    """When this account is next usable: `now`, or the later of its blocking
+    windows' resets. A week-exhausted account isn't helped by a 5h reset; an
+    exhausted window with no known reset never clears (7d) or clears now (5h)."""
+    info = STATE.accounts.get(name, Account())
+    t = now
+    if utilization(name) >= threshold(name):
+        t = max(t, info.reset_5h or now)
+    if util_7d(name) >= threshold_7d(name):
+        t = max(t, info.reset_7d or float("inf"))
+    return t
 
 
 def earliest_relief() -> float:
-    """Soonest moment any account's 5h window resets (for hold-until-reset)."""
+    """Soonest moment any non-disabled account becomes usable again (relief_ts),
+    for hold-until-reset and Retry-After; 5 minutes out if no account has a
+    known reset ahead."""
     now = time.time()
-    resets = [i.get("reset_5h") for i in STATE["accounts"].values()
-              if i.get("reset_5h") and i["reset_5h"] > now]
-    return min(resets) if resets else now + 300
+    pool = [n for n in ACCOUNTS if not disabled(n)] or list(ACCOUNTS)
+    reliefs = [t for t in (relief_ts(n, now) for n in pool) if now < t < float("inf")]
+    return min(reliefs) if reliefs else now + 300
 
 
 def pick_account() -> str:
@@ -190,7 +414,9 @@ def pick_account() -> str:
     consume-first (default): burn the usable account whose weekly window resets
     soonest — weekly quota is use-it-or-lose-it, so spend the perishable one.
     least-used: lowest 5h utilization.
-    If nothing is usable, the non-disabled account whose 5h window resets soonest.
+    If nothing is usable, the non-disabled account that becomes usable soonest
+    (relief_ts) -- never a week-exhausted account just because its 5h window
+    reset long ago.
     """
     under = [n for n in ACCOUNTS if usable(n)]
     if under:
@@ -198,7 +424,8 @@ def pick_account() -> str:
             return min(under, key=lambda n: (priority(n), weekly_reset(n), utilization(n)))
         return min(under, key=lambda n: (priority(n), utilization(n)))
     pool = [n for n in ACCOUNTS if not disabled(n)] or list(ACCOUNTS)
-    return min(pool, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
+    now = time.time()
+    return min(pool, key=lambda n: (relief_ts(n, now), priority(n)))
 
 
 async def note_response(account: str, headers: httpx.Headers, status: int) -> str | None:
@@ -213,7 +440,7 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
         return float(v) if v is not None else None
 
     async with state_lock:
-        info = STATE["accounts"].setdefault(account, {})
+        info = STATE.accounts.setdefault(account, Account())
         for key, header in (
             ("util_5h", "anthropic-ratelimit-unified-5h-utilization"),
             ("util_7d", "anthropic-ratelimit-unified-7d-utilization"),
@@ -222,13 +449,13 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
         ):
             val = _f(header)
             if val is not None:
-                info[key] = val
+                setattr(info, key, val)
         if headers.get("anthropic-ratelimit-unified-status"):
-            info["status"] = headers["anthropic-ratelimit-unified-status"]
+            info.status = headers["anthropic-ratelimit-unified-status"]
         now = time.time()
-        info["last_seen"] = now
+        info.last_seen = now
 
-        quota_hit = info.get("status") == "rejected" or (
+        quota_hit = info.status == "rejected" or (
             status == 429 and (utilization(account) >= 1.0 or util_7d(account) >= 1.0))
         if status == 429 and not quota_hit:
             # Per-minute burst limit, not spent quota. Rotating would just move
@@ -238,17 +465,18 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
                 pace = min(float(headers.get("retry-after", "")), 60.0)
             except ValueError:
                 pace = 15.0
-            info["pace_until"] = now + pace
+            info.pace_until = now + pace
             save_state()
             return "burst"
 
         verdict = None
-        if STATE["active_account"] != account:
+        if STATE.active_account != account:
             # Another request already rotated; a retry rides the new active.
             verdict = "switched" if quota_hit else None
         else:
-            cooled = now - STATE.get("last_switch_ts", 0) >= COOLDOWN_S
-            over = utilization(account) >= THRESHOLD or util_7d(account) >= THRESHOLD_7D
+            cooled = now - STATE.last_switch_ts >= COOLDOWN_S
+            over = (utilization(account) >= threshold(account)
+                    or util_7d(account) >= threshold_7d(account))
             nxt = pick_account()
             reason = None
             if nxt != account:
@@ -261,10 +489,10 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
                     # two accounts hovering at the line never ping-pong. A move
                     # to a preferred tier, or off a week-exhausted account,
                     # skips the margin.
-                    if (util_7d(account) >= THRESHOLD_7D
+                    if (util_7d(account) >= threshold_7d(account)
                             or priority(nxt) < priority(account)
                             or utilization(nxt) <= utilization(account) - SWITCH_MARGIN):
-                        reason = f"utilization>={THRESHOLD}"
+                        reason = f"utilization>={threshold(account)}"
                 elif cooled and usable(nxt):
                     if priority(nxt) < priority(account):
                         # A preferred account has room again — pull traffic back.
@@ -275,16 +503,16 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
                         # weekly window expires clearly sooner than the active one's.
                         reason = "consume_first"
             if reason:
-                STATE["active_account"] = nxt
-                STATE["last_switch_ts"] = now
-                STATE["events"].append({
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "type": "switch",
-                    "from": account, "to": nxt,
-                    "reason": reason,
-                    "util": utilization(account),
-                })
-                STATE["events"] = STATE["events"][-200:]
+                STATE.active_account = nxt
+                STATE.last_switch_ts = now
+                STATE.events.append(Event(
+                    ts=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    type="switch",
+                    from_account=account, to_account=nxt,
+                    reason=reason,
+                    util=utilization(account),
+                ))
+                STATE.events = STATE.events[-200:]
                 verdict = "switched"
             elif quota_hit:
                 verdict = "exhausted"
@@ -314,6 +542,27 @@ def summarize_usage(usage: dict | None) -> dict | None:
         "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")}
 
 
+# Audit-record key -> the unified rate-limit header it copies (as the header's
+# string, the way util_5h always was). With both windows' utilization and
+# resets in every record, the audit log alone is a per-request time series of
+# each account's quota - e.g. to see between which two requests the weekly
+# percent stepped, and what those requests cost.
+AUDIT_RATE_LIMIT_HEADERS = {
+    "util_5h": "anthropic-ratelimit-unified-5h-utilization",
+    "util_7d": "anthropic-ratelimit-unified-7d-utilization",
+    "reset_5h": "anthropic-ratelimit-unified-5h-reset",
+    "reset_7d": "anthropic-ratelimit-unified-7d-reset",
+    "ratelimit_status": "anthropic-ratelimit-unified-status",
+}
+
+
+def rate_limit_fields(headers: httpx.Headers) -> dict:
+    """The audit record's rate-limit fields: util_5h always (None without the
+    header, as before), the others only when the response carried them."""
+    fields = {key: headers.get(header) for key, header in AUDIT_RATE_LIMIT_HEADERS.items()}
+    return {key: value for key, value in fields.items() if value is not None or key == "util_5h"}
+
+
 @app.get("/rotate/status")
 async def rotate_status(request: Request):
     if device_from_request(request) is None:
@@ -321,33 +570,46 @@ async def rotate_status(request: Request):
     now = time.time()
     accounts = {}
     for name in ACCOUNTS:
-        info = dict(STATE["accounts"].get(name, {}))
+        info = asdict(STATE.accounts.get(name, Account()))
         info["effective_util_5h"] = utilization(name)
         info["effective_util_7d"] = util_7d(name)
         info["priority"] = priority(name)
         info["disabled"] = disabled(name)
+        info["switch_threshold"] = threshold(name)
+        info["switch_threshold_7d"] = threshold_7d(name)
         if info.get("reset_5h"):
             info["reset_5h_in_min"] = max(0, round((info["reset_5h"] - now) / 60))
         if info.get("reset_7d"):
             info["reset_7d_in_h"] = max(0, round((info["reset_7d"] - now) / 3600, 1))
         accounts[name] = info
     return {
-        "active_account": STATE["active_account"],
+        "active_account": STATE.active_account,
         "switch_threshold": THRESHOLD,
         "switch_threshold_7d": THRESHOLD_7D,
         "strategy": STRATEGY,
         "hold_max_s": HOLD_MAX_S,
         "accounts": accounts,
         "codex_accounts": {
-            name: dict(STATE.setdefault("codex", {}).get(name, {}),
-                       usable=codex_image.usable(name, CODEX_ACCOUNTS, STATE["codex"],
-                                                 THRESHOLD, THRESHOLD_7D, now))
+            name: dict(asdict(STATE.codex.get(name, codex_image.Codex_account())),
+                       usable=codex_image.usable(name, CODEX_ACCOUNTS, STATE.codex,
+                                                 THRESHOLD, THRESHOLD_7D, now),
+                       switch_threshold=codex_image.account_threshold(
+                           CODEX_ACCOUNTS[name], THRESHOLD),
+                       switch_threshold_7d=codex_image.account_threshold_7d(
+                           CODEX_ACCOUNTS[name], THRESHOLD_7D))
             for name in CODEX_ACCOUNTS},
-        "recent_events": STATE["events"][-10:],
+        "recent_events": [e.to_json() for e in STATE.events[-10:]],
     }
 
 
 def device_from_request(request: Request) -> str | None:
+    # A device that keeps its own claude.ai login (so features that talk to
+    # claude.ai directly - Claude in Chrome, claude.ai connectors, /usage - keep
+    # working) sends its key in DEVICE_KEY_HEADER via ANTHROPIC_CUSTOM_HEADERS;
+    # its Authorization then carries that login's token, which is never forwarded.
+    key = request.headers.get(DEVICE_KEY_HEADER, "")
+    if key:
+        return DEVICE_BY_KEY.get(key)
     auth = request.headers.get("authorization", "")
     key = auth[7:] if auth.lower().startswith("bearer ") else request.headers.get("x-api-key", "")
     if not key:
@@ -355,21 +617,9 @@ def device_from_request(request: Request) -> str | None:
     return DEVICE_BY_KEY.get(key)
 
 
-# API list prices per MTok (input, output), matched by substring of the model id.
-# Cost columns are *API-equivalent* dollars: what this usage would cost pay-per-token.
-# Override in config.json under "prices_per_mtok".
-PRICES = CFG.get("prices_per_mtok", {
-    "fable": [10.0, 50.0], "mythos": [10.0, 50.0],
-    "opus": [5.0, 25.0],
-    "sonnet": [3.0, 15.0],
-    "haiku": [1.0, 5.0],
-})
-DEFAULT_PRICE = [5.0, 25.0]
-ALERT_CFG = CFG.get("alerts", {
-    "device_tokens_per_hour": 5_000_000,
-    "expensive_model_patterns": ["opus", "fable", "mythos"],
-    "util_warn": 0.8,
-})
+PRICES = CFG.prices_per_mtok  # see DEFAULT_PRICES
+DEFAULT_PRICE = [5.0, 25.0]  # a model matching no pattern
+ALERT_CFG = CFG.alerts
 
 
 def price_for(model: str | None) -> list[float]:
@@ -486,26 +736,26 @@ def aggregate_audit() -> dict:
                 device_hour_tokens.get(rec.get("device", "?"), 0) + total)
             device_hour_reqs[dev] = device_hour_reqs.get(dev, 0) + 1
             model = rec.get("model") or ""
-            if any(p in model for p in ALERT_CFG["expensive_model_patterns"]):
+            if any(p in model for p in ALERT_CFG.expensive_model_patterns):
                 key = f'{rec.get("device", "?")} / {model}'
                 expensive_hour[key] = expensive_hour.get(key, 0) + 1
 
     alerts = []
     for dev, toks in device_hour_tokens.items():
-        if toks > ALERT_CFG["device_tokens_per_hour"]:
+        if toks > ALERT_CFG.device_tokens_per_hour:
             alerts.append({"level": "warn",
                            "text": f"{dev} consumed {toks:,} tokens in the last hour "
-                                   f"(threshold {ALERT_CFG['device_tokens_per_hour']:,})"})
+                                   f"(threshold {ALERT_CFG.device_tokens_per_hour:,})"})
     for key, n in expensive_hour.items():
         alerts.append({"level": "info", "text": f"expensive model in use: {key} — {n} requests in the last hour"})
     for name in ACCOUNTS:
         u = utilization(name)
-        if u >= ALERT_CFG["util_warn"]:
-            alerts.append({"level": "warn", "text": f"{name} 5h window at {u:.0%} (switch threshold {THRESHOLD:.0%})"})
+        if u >= ALERT_CFG.util_warn:
+            alerts.append({"level": "warn", "text": f"{name} 5h window at {u:.0%} (switch threshold {threshold(name):.0%})"})
 
     # Roster covers every registered device, traffic or not.
     devices = {}
-    for name, key in CFG["devices"].items():
+    for name, key in CFG.devices.items():
         meta = device_meta.get(name, {})
         last_ts = meta.get("last_ts")
         devices[name] = {
@@ -529,72 +779,12 @@ async def rotate_stats(request: Request):
     return aggregate_audit()
 
 
-PANEL_HTML = """<!doctype html><html><head><meta charset="utf-8">
-<title>claude-rotate</title>
-<style>
- body{font-family:-apple-system,sans-serif;margin:2rem;background:#12151a;color:#e6e6e6}
- h1{font-size:1.3rem} h2{font-size:1rem;margin-top:1.6rem;color:#9ecbff}
- table{border-collapse:collapse;margin-top:.4rem;min-width:520px}
- td,th{padding:.3rem .8rem;border-bottom:1px solid #2a2f38;text-align:right;font-variant-numeric:tabular-nums}
- td:first-child,th:first-child{text-align:left}
- .gauge{display:inline-block;width:220px;height:12px;background:#2a2f38;border-radius:6px;overflow:hidden;vertical-align:middle;margin:0 .6rem}
- .gauge i{display:block;height:100%;background:#4caf7d} .gauge i.hot{background:#e0664d}
- .active{color:#7dd87d;font-weight:600} .alert-warn{color:#ffb454} .alert-info{color:#9ecbff}
- .muted{color:#8a919c;font-size:.85rem}
-</style></head><body>
-<h1>claude-rotate <span class="muted" id="upd"></span></h1>
-<h2>Devices</h2><table id="t-roster"></table>
-<div id="accounts"></div>
-<h2>Alerts</h2><div id="alerts" class="muted">none</div>
-<h2>Consumption by device (24h)</h2><table id="t-device"></table>
-<h2>Consumption by model (24h)</h2><table id="t-model"></table>
-<h2>Consumption by account (24h)</h2><table id="t-account"></table>
-<h2>Recent switches</h2><div id="events" class="muted">none</div>
-<p class="muted">Cost = API-equivalent dollars at list prices (incl. cache read 0.1x / write 1.25x) — actual spend is covered by the Max subscriptions.</p>
-<script>
-const KEY = new URLSearchParams(location.search).get('key');
-function fmt(n){return n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':''+n}
-function table(el, data){
-  let h='<tr><th></th><th>req</th><th>in</th><th>out</th><th>cache r</th><th>cache w</th><th>$ equiv</th></tr>';
-  for(const [k,v] of Object.entries(data))
-    h+=`<tr><td>${k}</td><td>${v.requests}</td><td>${fmt(v.input_tokens)}</td><td>${fmt(v.output_tokens)}</td><td>${fmt(v.cache_read)}</td><td>${fmt(v.cache_write)}</td><td>$${v.cost_usd.toFixed(2)}</td></tr>`;
-  el.innerHTML=h;
-}
-async function refresh(){
-  const [st, stats] = await Promise.all([
-    fetch('/rotate/status?key='+KEY).then(r=>r.json()),
-    fetch('/rotate/stats?key='+KEY).then(r=>r.json())]);
-  let rh='<tr><th>device</th><th>status</th><th>last seen</th><th>last model</th><th>via account</th><th>req 1h</th><th>tokens 1h</th><th>key</th></tr>';
-  for(const [name,d] of Object.entries(stats.devices||{})){
-    const status = d.online ? '<span class="active">● online</span>' : '<span class="muted">○ idle</span>';
-    const seen = d.last_seen_min==null ? 'never' : d.last_seen_min<1 ? 'just now'
-      : d.last_seen_min<60 ? d.last_seen_min+' min ago' : (d.last_seen_min/60).toFixed(1)+' h ago';
-    rh+=`<tr><td>${name}</td><td>${status}</td><td>${seen}</td><td>${d.last_model||'—'}</td><td>${d.last_account||'—'}</td><td>${d.req_1h}</td><td>${fmt(d.tokens_1h)}</td><td class="muted">${d.key_suffix}</td></tr>`;
-  }
-  document.getElementById('t-roster').innerHTML=rh;
-  let h='';
-  for(const [name,a] of Object.entries(st.accounts)){
-    const u=a.effective_util_5h||0, w=a.util_7d||0;
-    const act=name===st.active_account?' <span class="active">● active</span>':'';
-    const tags=(a.disabled?' <span class="alert-warn">(disabled)</span>':'')
-      +(a.priority!==100?` <span class="muted">prio ${a.priority}</span>`:'');
-    h+=`<p><b>${name}</b>${tags}${act}<br>5h <span class="gauge"><i class="${u>=st.switch_threshold?'hot':''}" style="width:${Math.min(100,u*100)}%"></i></span>${(u*100).toFixed(0)}%`
-      +(a.reset_5h_in_min!=null?` <span class="muted">resets in ${a.reset_5h_in_min} min</span>`:'')
-      +`<br>7d <span class="gauge"><i style="width:${Math.min(100,w*100)}%"></i></span>${(w*100).toFixed(0)}%`
-      +(a.reset_7d_in_h!=null?` <span class="muted">resets in ${a.reset_7d_in_h} h</span>`:'')+`</p>`;
-  }
-  document.getElementById('accounts').innerHTML=h;
-  document.getElementById('alerts').innerHTML = stats.alerts.length
-    ? stats.alerts.map(a=>`<div class="alert-${a.level}">⚠ ${a.text}</div>`).join('') : 'none';
-  table(document.getElementById('t-device'), stats.by_device);
-  table(document.getElementById('t-model'), stats.by_model);
-  table(document.getElementById('t-account'), stats.by_account);
-  document.getElementById('events').innerHTML = st.recent_events.length
-    ? st.recent_events.map(e=>`<div>${e.ts} — ${e.from} → ${e.to} (${e.reason})</div>`).join('') : 'none';
-  document.getElementById('upd').textContent='updated '+new Date().toLocaleTimeString();
-}
-refresh(); setInterval(refresh, 10000);
-</script></body></html>"""
+# The panel's page, style and script live in panel/ and are read per request,
+# so editing them needs no restart. Only the page asks for a device key: the
+# stylesheet and script hold no data — they fetch it from /rotate/status and
+# /rotate/stats with the page's ?key=.
+PANEL_DIR = ROOT / "panel"
+PANEL_ASSETS = {"panel.css": "text/css", "panel.js": "text/javascript"}
 
 
 @app.get("/rotate/panel")
@@ -602,7 +792,14 @@ async def rotate_panel(request: Request):
     if device_from_request(request) is None:
         return JSONResponse({"error": "unknown device key — open /rotate/panel?key=<device key>"},
                             status_code=401)
-    return Response(content=PANEL_HTML, media_type="text/html")
+    return FileResponse(PANEL_DIR / "panel.html", media_type="text/html")
+
+
+@app.get("/rotate/panel/{asset}")
+async def rotate_panel_asset(asset: str):
+    if asset not in PANEL_ASSETS:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(PANEL_DIR / asset, media_type=PANEL_ASSETS[asset])
 
 
 async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
@@ -617,9 +814,9 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
     noted = False
     verdict = None
     while True:
-        account = STATE["active_account"]
-        fwd_headers["authorization"] = f"Bearer {ACCOUNTS[account]['token']}"
-        pace = STATE["accounts"].get(account, {}).get("pace_until", 0) - time.time()
+        account = STATE.active_account
+        fwd_headers["authorization"] = f"Bearer {ACCOUNTS[account].token}"
+        pace = STATE.accounts.get(account, Account()).pace_until - time.time()
         if pace > 0:
             await asyncio.sleep(min(pace, 60))
         upstream = await client.send(
@@ -643,11 +840,11 @@ async def send_upstream(method: str, url: str, fwd_headers: dict, body: bytes):
         retries += 1
         if wait > 0:
             async with state_lock:
-                STATE["events"].append({
-                    "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "type": "hold",
-                    "from": account, "to": account,
-                    "reason": f"all accounts spent; holding {round(wait)}s"})
-                STATE["events"] = STATE["events"][-200:]
+                STATE.events.append(Event(
+                    ts=time.strftime("%Y-%m-%dT%H:%M:%S%z"), type="hold",
+                    from_account=account, to_account=account,
+                    reason=f"all accounts spent; holding {round(wait)}s"))
+                STATE.events = STATE.events[-200:]
                 save_state()
             await asyncio.sleep(wait)
 
@@ -720,8 +917,7 @@ async def openai_chat(request: Request):
             finally:
                 await upstream.aclose()
                 rec["usage"] = summarize_usage(tr.usage)
-                rec["util_5h"] = upstream.headers.get(
-                    "anthropic-ratelimit-unified-5h-utilization")
+                rec.update(rate_limit_fields(upstream.headers))
                 audit(rec)
                 await note_response(account, upstream.headers, upstream.status_code)
 
@@ -732,7 +928,7 @@ async def openai_chat(request: Request):
     await upstream.aclose()
     if not noted:
         await note_response(account, upstream.headers, upstream.status_code)
-    rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
+    rec.update(rate_limit_fields(upstream.headers))
     if upstream.status_code != 200:
         try:
             msg = json.loads(content).get("error", {}).get("message") \
@@ -761,7 +957,7 @@ async def openai_images(request: Request):
                                        "type": "authentication_error"}}, status_code=401)
     if not CODEX_ACCOUNTS:
         return JSONResponse({"error": {"message": "claude-rotate: no codex accounts "
-                                                  "configured (./setup.sh add-codex-account)",
+                                                  "configured (./setup.py add-codex-account)",
                                        "type": "invalid_request_error"}}, status_code=503)
     try:
         body = json.loads(await request.body())
@@ -779,17 +975,17 @@ async def openai_images(request: Request):
     async with codex_slots:
         result = await codex_image.generate(
             prompt, body.get("size"), accounts=CODEX_ACCOUNTS,
-            state=STATE.setdefault("codex", {}), runner=codex_image.run_codex,
-            codex_bin=CODEX_CFG.get("bin", "codex"),
-            model=CODEX_CFG.get("model", "gpt-6.1-sol"),
-            effort=CODEX_CFG.get("reasoning_effort", "low"),
-            timeout_s=CODEX_CFG.get("timeout_s", 300),
+            state=STATE.codex, runner=codex_image.run_codex,
+            codex_bin=CODEX_CFG.bin,
+            model=CODEX_CFG.model,
+            effort=CODEX_CFG.reasoning_effort,
+            timeout_s=CODEX_CFG.timeout_s,
             threshold=THRESHOLD, threshold_7d=THRESHOLD_7D)
     async with state_lock:
         save_state()
 
     rec = {"device": device, "account": result["account"], "path": "/v1/images/generations",
-           "model": CODEX_CFG.get("model", "gpt-6.1-sol"), "kind": "image",
+           "model": CODEX_CFG.model, "kind": "image",
            "elapsed_s": result["elapsed_s"]}
     if len(result["tried"]) > 1:
         rec["retries"] = len(result["tried"]) - 1
@@ -847,6 +1043,11 @@ async def proxy(request: Request, path: str):
            "model": model, "status": upstream.status_code}
     if retries:
         rec["retries"] = retries
+    # Claude Code names its session in every request; with it an audit record
+    # can be matched to the transcript entry it produced.
+    session_id = request.headers.get(SESSION_HEADER)
+    if session_id:
+        rec["session_id"] = session_id
     resp_headers = {k: v for k, v in upstream.headers.items()
                     if k.lower() not in HOP and k.lower() != "content-encoding"}
     resp_headers["x-rotate-account"] = account
@@ -862,7 +1063,7 @@ async def proxy(request: Request, path: str):
             finally:
                 await upstream.aclose()
                 rec["usage"] = summarize_usage(usage_acc)
-                rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
+                rec.update(rate_limit_fields(upstream.headers))
                 audit(rec)
                 await note_response(account, upstream.headers, upstream.status_code)
 
@@ -876,7 +1077,7 @@ async def proxy(request: Request, path: str):
         rec["usage"] = summarize_usage(json.loads(content).get("usage"))
     except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
         pass
-    rec["util_5h"] = upstream.headers.get("anthropic-ratelimit-unified-5h-utilization")
+    rec.update(rate_limit_fields(upstream.headers))
     if rec["path"].startswith("/v1/messages") or rec.get("usage"):
         audit(rec)
     if not noted:
@@ -885,5 +1086,5 @@ async def proxy(request: Request, path: str):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=CFG.get("bind", "127.0.0.1"), port=CFG.get("port", 8484),
+    uvicorn.run(app, host=CFG.bind, port=CFG.port,
                 log_level="warning")
