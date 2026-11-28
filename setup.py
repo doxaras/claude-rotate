@@ -179,8 +179,10 @@ def register_device(name: str) -> str:
 
 
 def cmd_add_device(args: argparse.Namespace) -> int:
-    key = register_device(args.name)
+    # public_url() first: it can exit (no json5), and a key stored before that
+    # would never be shown.
     url = public_url()
+    key = register_device(args.name)
     print(f"device '{args.name}' registered. On that machine set:")
     print(f"  export ANTHROPIC_BASE_URL={url}")
     print(f"  export CLAUDE_CODE_OAUTH_TOKEN={key}")
