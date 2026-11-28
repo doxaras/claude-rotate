@@ -94,6 +94,8 @@ class Account_config:
     token: str
     priority: int = 100  # lower = preferred tier
     disabled: bool = False  # benched: never picked, left at once when active
+    switch_threshold: float | None = None  # None = the global switch_threshold
+    switch_threshold_7d: float | None = None  # None = the global switch_threshold_7d
 
 
 @dataclass(slots=True)
@@ -344,9 +346,23 @@ def disabled(name: str) -> bool:
     return ACCOUNTS[name].disabled
 
 
+def threshold(name: str) -> float:
+    """The 5h utilization at which this account is left: its own
+    switch_threshold from account_options, else the global one."""
+    own = ACCOUNTS[name].switch_threshold
+    return THRESHOLD if own is None else own
+
+
+def threshold_7d(name: str) -> float:
+    """The weekly utilization that makes this account unusable: its own
+    switch_threshold_7d from account_options, else the global one."""
+    own = ACCOUNTS[name].switch_threshold_7d
+    return THRESHOLD_7D if own is None else own
+
+
 def usable(name: str) -> bool:
     return (not disabled(name)
-            and utilization(name) < THRESHOLD and util_7d(name) < THRESHOLD_7D)
+            and utilization(name) < threshold(name) and util_7d(name) < threshold_7d(name))
 
 
 WEEK_S = 7 * 24 * 3600
@@ -373,9 +389,9 @@ def relief_ts(name: str, now: float) -> float:
     exhausted window with no known reset never clears (7d) or clears now (5h)."""
     info = STATE.accounts.get(name, Account())
     t = now
-    if utilization(name) >= THRESHOLD:
+    if utilization(name) >= threshold(name):
         t = max(t, info.reset_5h or now)
-    if util_7d(name) >= THRESHOLD_7D:
+    if util_7d(name) >= threshold_7d(name):
         t = max(t, info.reset_7d or float("inf"))
     return t
 
@@ -459,7 +475,8 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
             verdict = "switched" if quota_hit else None
         else:
             cooled = now - STATE.last_switch_ts >= COOLDOWN_S
-            over = utilization(account) >= THRESHOLD or util_7d(account) >= THRESHOLD_7D
+            over = (utilization(account) >= threshold(account)
+                    or util_7d(account) >= threshold_7d(account))
             nxt = pick_account()
             reason = None
             if nxt != account:
@@ -472,10 +489,10 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
                     # two accounts hovering at the line never ping-pong. A move
                     # to a preferred tier, or off a week-exhausted account,
                     # skips the margin.
-                    if (util_7d(account) >= THRESHOLD_7D
+                    if (util_7d(account) >= threshold_7d(account)
                             or priority(nxt) < priority(account)
                             or utilization(nxt) <= utilization(account) - SWITCH_MARGIN):
-                        reason = f"utilization>={THRESHOLD}"
+                        reason = f"utilization>={threshold(account)}"
                 elif cooled and usable(nxt):
                     if priority(nxt) < priority(account):
                         # A preferred account has room again — pull traffic back.
@@ -558,6 +575,8 @@ async def rotate_status(request: Request):
         info["effective_util_7d"] = util_7d(name)
         info["priority"] = priority(name)
         info["disabled"] = disabled(name)
+        info["switch_threshold"] = threshold(name)
+        info["switch_threshold_7d"] = threshold_7d(name)
         if info.get("reset_5h"):
             info["reset_5h_in_min"] = max(0, round((info["reset_5h"] - now) / 60))
         if info.get("reset_7d"):
@@ -573,7 +592,11 @@ async def rotate_status(request: Request):
         "codex_accounts": {
             name: dict(asdict(STATE.codex.get(name, codex_image.Codex_account())),
                        usable=codex_image.usable(name, CODEX_ACCOUNTS, STATE.codex,
-                                                 THRESHOLD, THRESHOLD_7D, now))
+                                                 THRESHOLD, THRESHOLD_7D, now),
+                       switch_threshold=codex_image.account_threshold(
+                           CODEX_ACCOUNTS[name], THRESHOLD),
+                       switch_threshold_7d=codex_image.account_threshold_7d(
+                           CODEX_ACCOUNTS[name], THRESHOLD_7D))
             for name in CODEX_ACCOUNTS},
         "recent_events": [e.to_json() for e in STATE.events[-10:]],
     }
@@ -728,7 +751,7 @@ def aggregate_audit() -> dict:
     for name in ACCOUNTS:
         u = utilization(name)
         if u >= ALERT_CFG.util_warn:
-            alerts.append({"level": "warn", "text": f"{name} 5h window at {u:.0%} (switch threshold {THRESHOLD:.0%})"})
+            alerts.append({"level": "warn", "text": f"{name} 5h window at {u:.0%} (switch threshold {threshold(name):.0%})"})
 
     # Roster covers every registered device, traffic or not.
     devices = {}

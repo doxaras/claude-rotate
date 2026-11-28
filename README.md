@@ -446,9 +446,10 @@ migrates first too; `rotator.py` refuses to start on the old layout.
 
 | `config.json5` field | Meaning |
 |---|---|
-| `account_options{}` | `name → {priority, disabled}` for an account in `confidential.json` (Claude or Codex) |
+| `account_options{}` | `name → {priority, disabled, switch_threshold, switch_threshold_7d}` for an account in `confidential.json` (Claude or Codex) |
 | `account_options.<name>.priority` | lower = preferred; accounts form tiers, backup tiers only used when every preferred account is spent (default 100) |
 | `account_options.<name>.disabled` | `true` benches an account: never rotated onto, still shown in the panel |
+| `account_options.<name>.switch_threshold`, `.switch_threshold_7d` | this account's own thresholds, in place of the global ones below (default: the global ones) |
 | `bind`, `port` | where the proxy listens (default `127.0.0.1`, `8484`) |
 | `public_url` | the URL `add-device`/`onboard` print for devices |
 | `switch_threshold` | 5h-window utilization that triggers rotation (default 0.8) |
@@ -465,7 +466,8 @@ migrates first too; `rotator.py` refuses to start on the old layout.
 ### Rotation policy
 
 An account is *usable* while its 5h window is under `switch_threshold` and its
-weekly window under `switch_threshold_7d`; a window past its reset counts as
+weekly window under `switch_threshold_7d` — its own values from
+`account_options` where it has them; a window past its reset counts as
 0%. State survives restarts in `state.json`.
 
 - **`consume-first`** (default): burn the usable account whose **weekly window
@@ -489,7 +491,7 @@ weekly window under `switch_threshold_7d`; a window past its reset counts as
 
 ### Preferring one account over another
 
-Three levels of control, from lazy to pro — all in the same `config.json5`,
+Four levels of control, from lazy to pro — all in the same `config.json5`,
 deliberately **no separate rules file** (see design note below):
 
 **Level 0 — do nothing.** The defaults (consume-first + thresholds + cooldown)
@@ -518,6 +520,20 @@ while keeping it visible in the panel. If the *active* account is disabled in
 config, the proxy abandons it on the next response, cooldown or not. Re-enable
 by deleting the flag; both changes need a restart (hot reload is on the roadmap).
 
+**Level 3 — per-account thresholds.** An account can carry its own
+`switch_threshold` / `switch_threshold_7d`, in place of the global ones — to
+leave a shared account early and keep some of its window for its owner, or to
+run one to the end:
+
+```json5
+"account_options": {
+  "shared": {"switch_threshold": 0.6, "switch_threshold_7d": 0.8},
+  "mine":   {"switch_threshold": 0.98},  // weekly: the global switch_threshold_7d
+},
+```
+
+The panel tags an account whose thresholds differ from the global ones.
+
 Combine with `strategy` for the remaining temperament choice: `consume-first`
 (spend perishable weekly quota first) or `least-used` (spread evenly).
 
@@ -525,7 +541,7 @@ Combine with `strategy` for the remaining temperament choice: `consume-first`
 time-of-day windows, per-device pinning) would add a parser, a second config
 file, and an ordering semantics to a one-file tool, and every use case we've
 actually hit decomposes into the four knobs above (strategy, priority,
-disabled, thresholds). If a real need appears that doesn't decompose — say
+disabled, thresholds — global or per account). If a real need appears that doesn't decompose — say
 per-device account pinning — add it as another plain field on the existing
 config objects, not as a DSL.
 

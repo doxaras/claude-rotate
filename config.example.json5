@@ -16,10 +16,12 @@
   hold_max_s: 0,                  // when every account is spent, hold a request up to this long for a reset; 0 = return 429
 
   // Per-account options, by the account's name in confidential.json (Claude and Codex accounts alike):
-  //   "priority": lower = preferred tier (default 100); "disabled": true benches the account.
+  //   "priority": lower = preferred tier (default 100); "disabled": true benches the account;
+  //   "switch_threshold" / "switch_threshold_7d": this account's own thresholds (default: the global ones above).
   account_options: {
     // "acct-1": {"priority": 1},
     // "acct-2": {"priority": 2, "disabled": false},
+    // "acct-3": {"switch_threshold": 0.95, "switch_threshold_7d": 0.9},
   },
 
   prices_per_mtok: {              // the cost columns: API list $ per million tokens [input, output], by substring of the model id

@@ -71,11 +71,13 @@ def test_settings_are_json5_with_comments_and_account_options():
         {
           "switch_threshold": 0.9,  // same-line comment
           strategy: 'least-used',   /* unquoted key, single quotes */
-          "account_options": {"b": {"priority": 2, "disabled": true}},
+          "account_options": {"b": {"priority": 2, "disabled": true,
+                                    "switch_threshold": 0.6, "switch_threshold_7d": 0.7}},
         }""")
     assert cfg.switch_threshold == 0.9 and cfg.strategy == "least-used"
     by_name = {a.name: a for a in cfg.accounts}
-    assert by_name["b"] == R.Account_config(name="b", token="sk-ant-oat01-b", priority=2, disabled=True)
+    assert by_name["b"] == R.Account_config(name="b", token="sk-ant-oat01-b", priority=2, disabled=True,
+                                             switch_threshold=0.6, switch_threshold_7d=0.7)
     assert by_name["a"] == R.Account_config(name="a", token="sk-ant-oat01-test")
 
 

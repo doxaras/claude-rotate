@@ -267,4 +267,25 @@ try:
 except AttributeError:
     check("misspelt field rejected", True)
 
+# 14. per-account thresholds: an account's own values replace the global ones
+R.ACCOUNTS = {"a": acct("a", switch_threshold=0.5), "b": acct("b", switch_threshold_7d=0.7), "c": acct("c")}
+check("own thresholds, the global ones elsewhere",
+      (R.threshold("a"), R.threshold_7d("a"), R.threshold("b"), R.threshold_7d("b"), R.threshold("c"))
+      == (0.5, 0.98, 0.8, 0.7, 0.8))
+fresh_state("a")
+R.STATE.accounts = {
+    "a": R.Account(util_5h=0.6, util_7d=0.1, reset_5h=now + 1000, reset_7d=now + 100000),
+    "b": R.Account(util_5h=0.1, util_7d=0.75, reset_7d=now + 200000),
+    "c": R.Account(util_5h=0.3, util_7d=0.1, reset_7d=now + 300000),
+}
+check("own 5h threshold makes an account unusable", not R.usable("a"))
+check("own 7d threshold makes an account unusable", not R.usable("b"))
+check("relief_ts uses the own threshold", abs(R.relief_ts("a", now) - (now + 1000)) < 1)
+v = run(R.note_response("a", headers(u5=0.6, u7=0.1), 200))
+check("own 5h threshold switches", v == "switched" and R.STATE.active_account == "c")
+check("switch reason names the own threshold", R.STATE.events[-1].reason == "utilization>=0.5")
+R.ACCOUNTS["a"].switch_threshold = 0.9
+R.STATE.accounts["a"].util_5h = 0.85
+check("a higher own threshold keeps an account usable past the global one", R.usable("a"))
+
 print(f"\nall {PASS} checks passed")

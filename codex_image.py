@@ -40,6 +40,20 @@ class Codex_account_config:
     codex_home: str
     priority: int = 100  # lower = preferred tier
     disabled: bool = False
+    switch_threshold: float | None = None  # None = the global switch_threshold
+    switch_threshold_7d: float | None = None  # None = the global switch_threshold_7d
+
+
+def account_threshold(account: Codex_account_config, default: float) -> float:
+    """The 5h utilization at which this account stops being used: its own
+    switch_threshold, else `default` (the global one)."""
+    return default if account.switch_threshold is None else account.switch_threshold
+
+
+def account_threshold_7d(account: Codex_account_config, default: float) -> float:
+    """The weekly utilization at which this account stops being used: its own
+    switch_threshold_7d, else `default` (the global one)."""
+    return default if account.switch_threshold_7d is None else account.switch_threshold_7d
 
 
 @dataclass(slots=True)
@@ -138,14 +152,19 @@ def read_session(codex_home: Path, thread_id: str) -> str:
 def usable(name: str, accounts: dict[str, Codex_account_config],
            state: dict[str, Codex_account], threshold: float,
            threshold_7d: float, now: float) -> bool:
-    if accounts[name].disabled:
+    """Not disabled, not benched, and both windows under the account's
+    thresholds; `threshold` / `threshold_7d` are the global ones, used where
+    the account has none of its own."""
+    account = accounts[name]
+    if account.disabled:
         return False
     info = state.get(name, Codex_account())
     if info.benched_until > now:
         return False
     u5 = 0.0 if info.reset_5h and now >= info.reset_5h else info.util_5h
     u7 = 0.0 if info.reset_7d and now >= info.reset_7d else info.util_7d
-    return u5 < threshold and u7 < threshold_7d
+    return (u5 < account_threshold(account, threshold)
+            and u7 < account_threshold_7d(account, threshold_7d))
 
 
 def pick_codex_account(accounts: dict[str, Codex_account_config],

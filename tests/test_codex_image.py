@@ -105,6 +105,22 @@ def test_pick_priority_then_consume_first():
     assert ci.pick_codex_account(accts, state, 0.8, 0.98, now, exclude={"b", "c"}) is None
 
 
+def test_per_account_thresholds():
+    now = time.time()
+    accts = {n: ci.Codex_account_config(name=n, codex_home="") for n in "abc"}
+    accts["a"].switch_threshold = 0.5
+    accts["b"].switch_threshold_7d = 0.7
+    accts["c"].switch_threshold = 0.9
+    state = {"a": ci.Codex_account(util_5h=0.6),
+             "b": ci.Codex_account(util_7d=0.75),
+             "c": ci.Codex_account(util_5h=0.85)}
+    # a and b are past their own thresholds; c is past the global 0.8 but not its own 0.9
+    assert [n for n in accts if ci.usable(n, accts, state, 0.8, 0.98, now)] == ["c"]
+    assert ci.pick_codex_account(accts, state, 0.8, 0.98, now) == "c"
+    assert ci.account_threshold(accts["b"], 0.8) == 0.8
+    assert ci.account_threshold_7d(accts["b"], 0.98) == 0.7
+
+
 def test_generate_success_records_telemetry():
     with tempfile.TemporaryDirectory() as d:
         accts = _accounts(Path(d), "plus-1")

@@ -30,13 +30,17 @@ async function refresh() {
 	let h = "";
 	for (const [name, a] of Object.entries(st.accounts)) {
 		const u = a.effective_util_5h||0, w = a.effective_util_7d||0;
+		// The account's own thresholds (account_options), else the global ones.
+		const t5 = a.switch_threshold ?? st.switch_threshold, t7 = a.switch_threshold_7d ?? st.switch_threshold_7d;
 		const act = name === st.active_account ? ' <span class="active">● active</span>' : "";
 		const tags = (a.disabled ? ' <span class="alert-warn">(disabled)</span>' : "") +
-			(a.priority !== 100 ? ` <span class="muted">prio ${a.priority}</span>` : "");
+			(a.priority !== 100 ? ` <span class="muted">prio ${a.priority}</span>` : "") +
+			(t5 !== st.switch_threshold || t7 !== st.switch_threshold_7d ?
+				` <span class="muted">thresholds ${(t5 * 100).toFixed(0)}% / ${(t7 * 100).toFixed(0)}%</span>` : "");
 		// /rotate/status leaves the *_in_* keys out while the reset is unknown.
-		h += `<p><b>${name}</b>${tags}${act}<br>5h ${gauge(u, a.reset_5h, 5 * 3600, u >= st.switch_threshold)}${(u * 100).toFixed(0)}%` +
+		h += `<p><b>${name}</b>${tags}${act}<br>5h ${gauge(u, a.reset_5h, 5 * 3600, u >= t5)}${(u * 100).toFixed(0)}%` +
 			(a.reset_5h_in_min !== undefined ? ` <span class="muted">resets in ${a.reset_5h_in_min} min</span>` : "") +
-			`<br>7d ${gauge(w, a.reset_7d, 7 * 86400, false)}${(w * 100).toFixed(0)}%` +
+			`<br>7d ${gauge(w, a.reset_7d, 7 * 86400, w >= t7)}${(w * 100).toFixed(0)}%` +
 			(a.reset_7d_in_h !== undefined ? ` <span class="muted">resets in ${a.reset_7d_in_h} h</span>` : "") + `</p>`;
 	}
 	if (h) h += '<p class="muted"><span class="pace"></span>= the elapsed share of the window: a bar past it is using the limit faster than the window runs out</p>';
